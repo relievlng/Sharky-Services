@@ -13,6 +13,7 @@ Everything logs to a rotating file and a Discord log channel.
 """
 
 import os
+import asyncio
 import sqlite3
 import secrets
 import string
@@ -68,6 +69,15 @@ CLAIM_TTL = int(os.environ.get("CLAIM_TTL", "1800"))
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")  # whsec_...
 STRIPE_SIG_TOLERANCE = int(os.environ.get("STRIPE_SIG_TOLERANCE", "300"))
 
+# Branding / tickets
+LOGO_URL = os.environ.get(
+    "LOGO_URL",
+    "https://cdn.discordapp.com/avatars/1567155897011015700/a2d69d6a45d15b27cc05a1b78f4f0b4a.png?size=512",
+)
+BRAND_NAME = os.environ.get("BRAND_NAME", "Sharky Services")
+BRAND_COLOR = int(os.environ.get("BRAND_COLOR", "0x2b2d31"), 16)
+TICKET_CATEGORY_ID = int(os.environ.get("TICKET_CATEGORY_ID", "0"))  # optional category for tickets
+
 # product name -> filename inside PRODUCTS_DIR
 PRODUCTS = {
     "metal_detector": "XZX_MetalDetector.ahk",
@@ -86,6 +96,8 @@ LOG_COLORS = {
     "key_generated":  0x5865F2,
     "linked":         0x5865F2,
     "log_setup":      0x57F287,
+    "ticket_open":    0x5865F2,
+    "ticket_close":   0xFEE75C,
     "delivered":      0x57F287,
     "delivered_link": 0x57F287,
     "closed_dms":     0xFEE75C,
@@ -124,6 +136,16 @@ def db_init():
         CREATE TABLE IF NOT EXISTS settings (
             key   TEXT PRIMARY KEY,
             value TEXT
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS tickets (
+            number      INTEGER PRIMARY KEY,
+            channel_id  INTEGER,
+            opener_id   INTEGER,
+            invoice_id  TEXT,
+            status      TEXT DEFAULT 'open',
+            created_at  TEXT NOT NULL
         )
     """)
     con.commit(); con.close()
@@ -201,6 +223,38 @@ def is_staff(interaction: discord.Interaction) -> bool:
     if perms is not None and (perms.administrator or perms.manage_guild):
         return True
     return ADMIN_ROLE in [r.name for r in getattr(member, "roles", [])]
+
+
+def brand_embed(title: str, description: str = None, color: int = None) -> discord.Embed:
+    """A dark, clean embed branded with the logo as a circular icon (no big white image)."""
+    e = discord.Embed(title=title, description=description,
+                      color=color if color is not None else BRAND_COLOR,
+                      timestamp=datetime.now(timezone.utc))
+    e.set_author(name=BRAND_NAME, icon_url=LOGO_URL)
+    e.set_footer(text=BRAND_NAME, icon_url=LOGO_URL)
+    return e
+
+
+def next_ticket_number() -> int:
+    n = int(get_setting("ticket_counter") or "0") + 1
+    set_setting("ticket_counter", str(n))
+    return n
+
+
+def record_ticket(number: int, channel_id: int, opener_id: int, invoice_id: str):
+    con = sqlite3.connect(DB_PATH)
+    con.execute(
+        "INSERT OR REPLACE INTO tickets (number, channel_id, opener_id, invoice_id, status, created_at) "
+        "VALUES (?, ?, ?, ?, 'open', ?)",
+        (number, channel_id, opener_id, invoice_id, datetime.now(timezone.utc).isoformat()),
+    )
+    con.commit(); con.close()
+
+
+def close_ticket_record(channel_id: int):
+    con = sqlite3.connect(DB_PATH)
+    con.execute("UPDATE tickets SET status = 'closed' WHERE channel_id = ?", (channel_id,))
+    con.commit(); con.close()
 
 
 # ===================== Signed tokens (links / state / claims) =====================
@@ -311,9 +365,8 @@ async def deliver(user: discord.abc.User, product: str) -> tuple[bool, str]:
     size = file_path.stat().st_size
     use_link = size > ATTACH_LIMIT_BYTES
 
-    embed = discord.Embed(title="Purchase Delivered",
-                          description=f"Thanks for buying **{product.replace('_', ' ').title()}**.",
-                          color=0x2b2d31)
+    embed = brand_embed("Purchase Delivered",
+                        f"Thanks for buying **{product.replace('_', ' ').title()}**.")
     embed.add_field(name="Your License Key", value=f"```{key}```", inline=False)
 
     try:
@@ -440,7 +493,128 @@ async def setup_status(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+@setup_group.command(name="tickets", description="Post the support ticket panel in this channel.")
+async def setup_tickets(interaction: discord.Interaction):
+    if not is_staff(interaction):
+        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        return
+    embed = brand_embed(
+        "Support",
+        "Need help with a purchase? Open a ticket below and enter your **Invoice ID**.\n"
+        "A staff member will be with you as soon as possible.",
+    )
+    await interaction.channel.send(embed=embed, view=TicketLauncher())
+    await interaction.response.send_message("Ticket panel posted.", ephemeral=True)
+
+
 bot.tree.add_command(setup_group)
+
+
+# ===================== Ticket system =====================
+class TicketModal(discord.ui.Modal, title="Open a Support Ticket"):
+    invoice_id = discord.ui.TextInput(
+        label="Invoice ID",
+        placeholder="Your purchase / invoice ID",
+        required=True, max_length=120,
+    )
+    issue = discord.ui.TextInput(
+        label="What do you need help with?",
+        style=discord.TextStyle.paragraph,
+        required=False, max_length=1000,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await create_ticket(interaction, str(self.invoice_id), str(self.issue))
+
+
+class TicketLauncher(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Open Ticket", style=discord.ButtonStyle.primary,
+                       emoji="\N{ADMISSION TICKETS}", custom_id="sharky_open_ticket")
+    async def open_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(TicketModal())
+
+
+class TicketCloseView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.danger,
+                       emoji="\N{LOCK}", custom_id="sharky_close_ticket")
+    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        channel = interaction.channel
+        # Opener or staff may close.
+        con = sqlite3.connect(DB_PATH)
+        row = con.execute("SELECT opener_id FROM tickets WHERE channel_id = ?",
+                          (channel.id,)).fetchone()
+        con.close()
+        opener_id = row[0] if row else None
+        if not (is_staff(interaction) or interaction.user.id == opener_id):
+            await interaction.response.send_message("Only staff or the ticket opener can close this.",
+                                                    ephemeral=True)
+            return
+        close_ticket_record(channel.id)
+        await log_event("ticket_close", user=interaction.user,
+                        detail=f"closed #{getattr(channel, 'name', channel.id)}")
+        await interaction.response.send_message("Closing this ticket in 5 seconds…")
+        await asyncio.sleep(5)
+        try:
+            await channel.delete(reason=f"Ticket closed by {interaction.user}")
+        except discord.HTTPException as e:
+            log.error("Failed to delete ticket channel %s: %s", channel.id, e)
+
+
+async def create_ticket(interaction: discord.Interaction, invoice_id: str, issue: str):
+    guild = interaction.guild
+    opener = interaction.user
+    if guild is None:
+        await interaction.response.send_message("Tickets can only be opened in a server.", ephemeral=True)
+        return
+
+    number = next_ticket_number()
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        opener: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
+    }
+    staff_role = discord.utils.get(guild.roles, name=ADMIN_ROLE)
+    if staff_role:
+        overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+
+    category = guild.get_channel(TICKET_CATEGORY_ID) if TICKET_CATEGORY_ID else None
+    if not isinstance(category, discord.CategoryChannel):
+        category = None
+
+    try:
+        channel = await guild.create_text_channel(
+            name=f"ticket-{number:04d}",
+            overwrites=overwrites,
+            category=category,
+            topic=f"Ticket #{number} • {opener} • Invoice: {invoice_id}",
+            reason=f"Support ticket opened by {opener}",
+        )
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            "I don't have permission to create channels. Give me the **Manage Channels** permission.",
+            ephemeral=True)
+        return
+
+    record_ticket(number, channel.id, opener.id, invoice_id)
+
+    embed = brand_embed(
+        f"Ticket #{number:04d}",
+        f"Thanks {opener.mention} — a staff member will be with you shortly.",
+    )
+    embed.add_field(name="Invoice ID", value=f"`{invoice_id}`", inline=False)
+    if issue.strip():
+        embed.add_field(name="Issue", value=issue[:1024], inline=False)
+
+    await channel.send(content=opener.mention, embed=embed, view=TicketCloseView())
+    await interaction.response.send_message(f"Ticket created: {channel.mention}", ephemeral=True)
+    await log_event("ticket_open", user=opener,
+                    detail=f"#{channel.name} • invoice {invoice_id}")
 
 
 # ===================== HTTP handlers =====================
@@ -572,9 +746,23 @@ async def start_http():
     log.info("HTTP server on %s:%s", HTTP_HOST, HTTP_PORT)
 
 
+_ready_once = False
+
+
 @bot.event
 async def on_ready():
+    global _ready_once
     db_init()
+    if _ready_once:
+        # Reconnect — don't re-sync, re-register views, or rebind the port.
+        log.info("Reconnected as %s", bot.user)
+        return
+    _ready_once = True
+
+    # Register persistent ticket views so their buttons work across restarts.
+    bot.add_view(TicketLauncher())
+    bot.add_view(TicketCloseView())
+
     try:
         if GUILD_ID:
             bot.tree.copy_global_to(guild=discord.Object(id=GUILD_ID))
