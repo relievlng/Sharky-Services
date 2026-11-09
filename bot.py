@@ -39,7 +39,7 @@ GUILD_ID = int(os.environ.get("GUILD_ID", "0"))
 ADMIN_ROLE = os.environ.get("ADMIN_ROLE", "Staff")
 DB_PATH = os.environ.get("DB_PATH", "licenses.db")
 PRODUCTS_DIR = Path(os.environ.get("PRODUCTS_DIR", "products"))
-KEY_PREFIX = os.environ.get("KEY_PREFIX", "XZX")
+KEY_PREFIX = os.environ.get("KEY_PREFIX", "SS")
 
 LOG_CHANNEL_ID = int(os.environ.get("LOG_CHANNEL_ID", "0"))
 LOG_FILE = os.environ.get("LOG_FILE", "xzx-delivery.log")
@@ -346,6 +346,25 @@ def verify_invoice(invoice_id: str, discord_id: int):
     if p.get("discord_id") and int(p["discord_id"]) != int(discord_id):
         return "mismatch", p
     return "ok", p
+
+
+def check_key_for_ticket(key: str, discord_id: int):
+    """
+    Verify a license key entered at ticket time.
+    Returns (status, row|None):
+      'ok'        - real key, belongs to this user (or unbound)
+      'revoked'   - real key but revoked (still their key)
+      'mismatch'  - real key bound to a different user
+      'not_found' - no such key
+    """
+    row = get_key((key or "").strip())
+    if row is None:
+        return "not_found", None
+    if row.get("discord_id") and int(row["discord_id"]) != int(discord_id):
+        return "mismatch", row
+    if row.get("revoked"):
+        return "revoked", row
+    return "ok", row
 
 
 # ----- Products (owner-managed; nothing hardcoded) -----
@@ -1181,18 +1200,22 @@ async def help_cmd(interaction: discord.Interaction):
 # ===================== Ticket system =====================
 # Ticket topics shown as buttons on the panel.
 TICKET_TOPICS = {
-    "sharky_tkt_purchase": ("Purchase", "\N{SHOPPING TROLLEY}", "Purchase / Delivery"),
-    "sharky_tkt_key":      ("Key", "\N{KEY}", "License Key / HWID"),
-    "sharky_tkt_billing":  ("Billing", "\N{CREDIT CARD}", "Billing / Refund"),
-    "sharky_tkt_other":    ("Other", "\N{SPEECH BALLOON}", "Other"),
+    "sharky_tkt_key":   ("Key Support", "\N{KEY}", "Key Support"),
+    "sharky_tkt_macro": ("Macro Support", "\N{VIDEO GAME}", "Macro Support"),
+    "sharky_tkt_other": ("Other", "\N{SPEECH BALLOON}", "Other"),
 }
 
 
 class TicketModal(discord.ui.Modal):
+    license_key = discord.ui.TextInput(
+        label="License Key",
+        placeholder="Your license key (e.g. SS-....) — we'll check it's legit",
+        required=False, max_length=120,
+    )
     invoice_id = discord.ui.TextInput(
-        label="Invoice ID",
+        label="Invoice ID (optional)",
         placeholder="The invoice ID from your purchase (e.g. INV-XXXX-XXXX)",
-        required=True, max_length=120,
+        required=False, max_length=120,
     )
     issue = discord.ui.TextInput(
         label="What do you need help with?",
@@ -1205,7 +1228,8 @@ class TicketModal(discord.ui.Modal):
         self.topic = topic
 
     async def on_submit(self, interaction: discord.Interaction):
-        await create_ticket(interaction, str(self.invoice_id), str(self.issue), self.topic)
+        await create_ticket(interaction, str(self.invoice_id), str(self.issue),
+                            self.topic, str(self.license_key))
 
 
 class TicketLauncher(discord.ui.View):
@@ -1229,11 +1253,10 @@ def ticket_panel_embed() -> discord.Embed:
     return brand_embed(
         "\N{ADMISSION TICKETS} Support",
         "Need a hand? Pick the topic that fits and we'll open a private ticket for you.\n\n"
-        "\N{SHOPPING TROLLEY} **Purchase** — didn't get your product or key\n"
-        "\N{KEY} **Key** — key not working or machine-locked\n"
-        "\N{CREDIT CARD} **Billing** — payment or refund questions\n"
+        "\N{KEY} **Key Support** — key not working or machine-locked\n"
+        "\N{VIDEO GAME} **Macro Support** — help with the macro itself\n"
         "\N{SPEECH BALLOON} **Other** — anything else\n\n"
-        "You'll be asked for your **Invoice ID** so we can verify your purchase. "
+        "You'll be asked for your **license key** so we can check it's legit. "
         "One open ticket at a time.",
     )
 
@@ -1301,7 +1324,7 @@ async def save_ticket_transcript(channel):
 
 
 async def create_ticket(interaction: discord.Interaction, invoice_id: str, issue: str,
-                        topic: str = "Support"):
+                        topic: str = "Support", license_key: str = ""):
     guild = interaction.guild
     opener = interaction.user
     if guild is None:
@@ -1318,20 +1341,51 @@ async def create_ticket(interaction: discord.Interaction, invoice_id: str, issue
             return
         close_ticket_record(existing[1])  # stale record; channel was deleted
 
-    # Verify the invoice is real and belongs to this buyer.
-    status, purchase = verify_invoice(invoice_id, opener.id)
-    if status == "not_found":
+    license_key = (license_key or "").strip()
+    invoice_id = (invoice_id or "").strip()
+    if not license_key and not invoice_id:
         await interaction.response.send_message(
-            "That invoice ID wasn't found. Double-check your purchase confirmation and try again.",
+            "Please enter your **license key** (or invoice ID) so we can verify your purchase.",
             ephemeral=True)
-        await log_event("verify_fail", user=opener, detail=f"ticket invoice not found: {invoice_id}")
         return
-    if status == "mismatch":
-        await interaction.response.send_message(
-            "That invoice belongs to a different account — you can only open a ticket for your own purchase.",
-            ephemeral=True)
-        await log_event("verify_fail", user=opener, detail=f"ticket invoice mismatch: {invoice_id}")
-        return
+
+    # Verify the license key — must be a real key, and yours.
+    key_line = None
+    purchase = {}
+    if license_key:
+        kstatus, krow = check_key_for_ticket(license_key, opener.id)
+        if kstatus == "not_found":
+            await interaction.response.send_message(
+                "That license key isn't recognised. Check it and try again.", ephemeral=True)
+            await log_event("verify_fail", user=opener, detail=f"ticket key not found: {license_key}")
+            return
+        if kstatus == "mismatch":
+            await interaction.response.send_message(
+                "That key belongs to a different account — you can only open a ticket for your own key.",
+                ephemeral=True)
+            await log_event("verify_fail", user=opener, detail=f"ticket key mismatch: {license_key}")
+            return
+        if kstatus == "revoked":
+            key_line = f"`{license_key}` \N{WARNING SIGN} legit but **revoked**"
+        else:
+            key_line = f"`{license_key}` \N{WHITE HEAVY CHECK MARK} legit key"
+        purchase = {"product": krow.get("product")}
+        await log_event("verify_ok", user=opener, key=license_key,
+                        product=krow.get("product"), detail="ticket key verified")
+
+    # Optional invoice check (if they gave one).
+    invoice_line = None
+    if invoice_id:
+        istatus, ipur = verify_invoice(invoice_id, opener.id)
+        if istatus == "mismatch":
+            await interaction.response.send_message(
+                "That invoice belongs to a different account.", ephemeral=True)
+            return
+        if istatus == "ok":
+            invoice_line = f"`{invoice_id}` \N{WHITE HEAVY CHECK MARK} verified"
+            purchase = ipur
+        else:
+            invoice_line = f"`{invoice_id}` \N{WARNING SIGN} not found"
 
     number = next_ticket_number()
     overwrites = {
@@ -1350,7 +1404,7 @@ async def create_ticket(interaction: discord.Interaction, invoice_id: str, issue
             name=f"ticket-{number:04d}",
             overwrites=overwrites,
             category=category,
-            topic=f"Ticket #{number} • {opener} • Invoice: {invoice_id}",
+            topic=f"Ticket #{number} • {opener} • {topic}",
             reason=f"Support ticket opened by {opener}",
         )
     except discord.Forbidden:
@@ -1359,7 +1413,7 @@ async def create_ticket(interaction: discord.Interaction, invoice_id: str, issue
             ephemeral=True)
         return
 
-    record_ticket(number, channel.id, opener.id, invoice_id)
+    record_ticket(number, channel.id, opener.id, invoice_id or license_key)
 
     prod = get_product(purchase.get("product") or "")
     product_label = (prod or {}).get("display_name") or purchase.get("product") or "—"
@@ -1369,15 +1423,18 @@ async def create_ticket(interaction: discord.Interaction, invoice_id: str, issue
     )
     embed.add_field(name="Topic", value=topic, inline=True)
     embed.add_field(name="Product", value=product_label, inline=True)
-    embed.add_field(name="Purchased", value=(purchase.get("created_at") or "")[:10] or "—", inline=True)
-    embed.add_field(name="Invoice", value=f"`{invoice_id}` \N{WHITE HEAVY CHECK MARK} verified", inline=False)
+    if key_line:
+        embed.add_field(name="License Key", value=key_line, inline=False)
+    if invoice_line:
+        embed.add_field(name="Invoice", value=invoice_line, inline=False)
     if issue.strip():
         embed.add_field(name="Issue", value=issue[:1024], inline=False)
 
     ping = opener.mention + (f" {staff_role.mention}" if staff_role else "")
     await channel.send(content=ping, embed=embed, view=TicketControls())
     await interaction.response.send_message(f"Ticket created: {channel.mention}", ephemeral=True)
-    await log_event("ticket_open", user=opener, detail=f"#{channel.name} • invoice {invoice_id}")
+    await log_event("ticket_open", user=opener,
+                    detail=f"#{channel.name} • {topic} • key={license_key or '-'}")
 
 
 # ===================== Server logs (joins, leaves, edits, deletes, bans) =====================
