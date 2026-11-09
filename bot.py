@@ -25,7 +25,7 @@ import json
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import discord
 from discord import app_commands
@@ -82,6 +82,14 @@ TICKET_CATEGORY_ID = int(os.environ.get("TICKET_CATEGORY_ID", "0"))  # optional 
 # License verification API (your macros POST their key here to check validity)
 VERIFY_API_KEY = os.environ.get("VERIFY_API_KEY", "")  # if set, callers must send it as X-Api-Key
 HWID_LOCK = os.environ.get("HWID_LOCK", "1") != "0"    # bind each key to the first machine that uses it
+
+# Subscription durations (days). None = lifetime / never expires.
+DURATIONS = {
+    "day":      1,
+    "week":     7,
+    "month":    30,
+    "lifetime": None,
+}
 
 # Products are stored in the database and managed with /product add|remove|list.
 # Files live in PRODUCTS_DIR. Nothing is hardcoded — the owner adds their own.
@@ -201,21 +209,30 @@ def db_init():
         con.execute("ALTER TABLE licenses ADD COLUMN revoked INTEGER DEFAULT 0")
     if "last_used_at" not in existing:
         con.execute("ALTER TABLE licenses ADD COLUMN last_used_at TEXT")
+    if "expires_at" not in existing:
+        con.execute("ALTER TABLE licenses ADD COLUMN expires_at TEXT")
+    if "duration" not in existing:
+        con.execute("ALTER TABLE licenses ADD COLUMN duration TEXT DEFAULT 'lifetime'")
     tcols = {r[1] for r in con.execute("PRAGMA table_info(tickets)").fetchall()}
     if "claimed_by" not in tcols:
         con.execute("ALTER TABLE tickets ADD COLUMN claimed_by INTEGER")
     con.commit(); con.close()
 
 
-def generate_key(product: str) -> str:
+def generate_key(product: str, duration: str = "lifetime") -> str:
+    now = datetime.now(timezone.utc)
+    days = DURATIONS.get(duration)
+    expires_at = (now + timedelta(days=days)).isoformat() if days else None
     con = sqlite3.connect(DB_PATH)
     try:
         for _ in range(10):
             body = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(16))
             key = f"{KEY_PREFIX}-{product[:4].upper()}-{body[:4]}-{body[4:8]}-{body[8:12]}-{body[12:]}"
             try:
-                con.execute("INSERT INTO licenses (key, product, created_at) VALUES (?, ?, ?)",
-                            (key, product, datetime.now(timezone.utc).isoformat()))
+                con.execute(
+                    "INSERT INTO licenses (key, product, created_at, duration, expires_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (key, product, now.isoformat(), duration, expires_at))
                 con.commit()
                 return key
             except sqlite3.IntegrityError:
@@ -223,6 +240,20 @@ def generate_key(product: str) -> str:
         raise RuntimeError("Could not generate a unique key after 10 attempts")
     finally:
         con.close()
+
+
+def human_expiry(row: dict) -> str:
+    """Readable expiry for a license row."""
+    exp = row.get("expires_at")
+    if not exp:
+        return "Lifetime"
+    try:
+        dt = datetime.fromisoformat(exp)
+    except ValueError:
+        return "Lifetime"
+    if dt < datetime.now(timezone.utc):
+        return "Expired"
+    return dt.strftime("%Y-%m-%d")
 
 
 def bind_key(key: str, discord_id: int):
@@ -279,6 +310,15 @@ def verify_key(key: str, hwid: str = None):
     if row.get("revoked"):
         con.close()
         return False, row["product"], "revoked"
+
+    exp = row.get("expires_at")
+    if exp:
+        try:
+            if datetime.fromisoformat(exp) < datetime.now(timezone.utc):
+                con.close()
+                return False, row["product"], "expired"
+        except ValueError:
+            pass
 
     if HWID_LOCK and hwid:
         bound = row.get("hwid")
@@ -667,11 +707,14 @@ async def log_event(event: str, *, user=None, product=None, key=None, detail=Non
 
 
 async def deliver(user: discord.abc.User, product: str,
-                  source: str = "manual", stripe_ref: str = None) -> tuple[bool, str]:
+                  source: str = "manual", stripe_ref: str = None,
+                  duration: str = "lifetime") -> tuple[bool, str]:
     prod = get_product(product)
     if prod is None:
         await log_event("failed", user=user, product=product, detail="unknown product")
         return False, f"Unknown product: {product}"
+    if duration not in DURATIONS:
+        duration = "lifetime"
     # Website purchases must be OAuth-verified. Staff deliveries are trusted and
     # always DM, even if the recipient never linked their account.
     if source == "stripe" and not is_linked(user.id):
@@ -683,12 +726,12 @@ async def deliver(user: discord.abc.User, product: str,
         await log_event("failed", user=user, product=product, detail="file missing on disk")
         return False, f"Product file not found for {product}"
 
-    key = generate_key(product)
+    key = generate_key(product, duration)
     bind_key(key, user.id)
     invoice_id = generate_invoice_id()
     record_purchase(invoice_id, user.id, product, key, source, stripe_ref)
     await log_event("key_generated", user=user, product=product, key=key,
-                    detail=f"invoice {invoice_id}")
+                    detail=f"invoice {invoice_id} • {duration}")
 
     size = file_path.stat().st_size
     use_link = size > ATTACH_LIMIT_BYTES
@@ -699,11 +742,14 @@ async def deliver(user: discord.abc.User, product: str,
 
     title = prod.get("display_name") or product.replace("_", " ").title()
 
+    plan_label = "Lifetime" if duration == "lifetime" else f"1 {duration}"
+
     def build_embed() -> discord.Embed:
         e = brand_embed("Purchase Delivered",
                         f"Thanks for buying **{title}**. Keep your key private — one key, one user.")
         e.add_field(name="Invoice ID", value=f"`{invoice_id}`", inline=True)
         e.add_field(name="Product", value=title, inline=True)
+        e.add_field(name="Plan", value=plan_label, inline=True)
         e.add_field(name="License Key", value=f"```{key}```", inline=False)
         if use_link:
             e.add_field(name="Download",
@@ -1159,10 +1205,11 @@ async def key_resend(interaction: discord.Interaction, key: str):
 
 @key_group.command(name="generate", description="Generate a key for a product, bound to a member.")
 @app_commands.describe(member="Who the key is for", product="Which product",
-                       dm="DM the key + file to them (default yes)")
+                       duration="Plan length", dm="DM the key + file to them (default yes)")
 @app_commands.autocomplete(product=product_autocomplete)
+@app_commands.choices(duration=[app_commands.Choice(name=d, value=d) for d in DURATIONS])
 async def key_generate(interaction: discord.Interaction, member: discord.Member,
-                       product: str, dm: bool = True):
+                       product: str, duration: app_commands.Choice[str] = None, dm: bool = True):
     if not is_staff(interaction):
         await interaction.response.send_message("You can't use this.", ephemeral=True)
         return
@@ -1170,19 +1217,21 @@ async def key_generate(interaction: discord.Interaction, member: discord.Member,
         await interaction.response.send_message(
             f"No product named `{product}`. Add it with `/product add`.", ephemeral=True)
         return
+    dur = duration.value if duration else "lifetime"
     await interaction.response.defer(ephemeral=True)
-    key = generate_key(product)
+    key = generate_key(product, dur)
     bind_key(key, member.id)
     invoice_id = generate_invoice_id()
     record_purchase(invoice_id, member.id, product, key, "admin")
     await log_event("key_generated", user=member, product=product, key=key,
-                    detail=f"admin-issued by {interaction.user} • invoice {invoice_id}")
+                    detail=f"admin-issued by {interaction.user} • invoice {invoice_id} • {dur}")
     sent = ""
     if dm:
         ok, reason = await send_existing_key(member, get_key(key))
         sent = "\n\N{WHITE HEAVY CHECK MARK} DMed to them." if ok else f"\n\N{WARNING SIGN} DM failed: {reason}"
+    plan = "Lifetime" if dur == "lifetime" else f"1 {dur}"
     await interaction.followup.send(
-        f"Generated a **{product}** key bound to {member.mention}:\n`{key}`\n"
+        f"Generated a **{product}** key ({plan}) bound to {member.mention}:\n`{key}`\n"
         f"Invoice: `{invoice_id}`{sent}", ephemeral=True)
 
 
@@ -1632,7 +1681,9 @@ async def handle_stripe(request):
         await log_event("failed", product=product, detail=f"could not fetch user {discord_id}")
         return web.json_response({"error": "user not found"}, status=404)
 
-    ok, result = await deliver(user, product, source="stripe", stripe_ref=session.get("id"))
+    duration = (meta.get("duration") or "lifetime").lower()
+    ok, result = await deliver(user, product, source="stripe",
+                               stripe_ref=session.get("id"), duration=duration)
     # Always 200 so Stripe doesn't retry; the bot has logged the outcome.
     return web.json_response({"ok": ok, "result": result}, status=200)
 
