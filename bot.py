@@ -891,11 +891,7 @@ async def setup_all(interaction: discord.Interaction):
             guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
         }
         support_ch = await guild.create_text_channel("support", category=tickets_cat, overwrites=support_view)
-        await support_ch.send(
-            embed=brand_embed("Support",
-                              "Need help with a purchase? Open a ticket below and enter your "
-                              "**Invoice ID**. A staff member will be with you shortly."),
-            view=TicketLauncher())
+        await support_ch.send(embed=ticket_panel_embed(), view=TicketLauncher())
         created.append(support_ch)
     except discord.Forbidden:
         await interaction.followup.send(
@@ -919,12 +915,7 @@ async def setup_tickets(interaction: discord.Interaction):
     if not is_staff(interaction):
         await interaction.response.send_message("You can't use this.", ephemeral=True)
         return
-    embed = brand_embed(
-        "Support",
-        "Need help with a purchase? Open a ticket below and enter your **Invoice ID**.\n"
-        "A staff member will be with you as soon as possible.",
-    )
-    await interaction.channel.send(embed=embed, view=TicketLauncher())
+    await interaction.channel.send(embed=ticket_panel_embed(), view=TicketLauncher())
     await interaction.response.send_message("Ticket panel posted.", ephemeral=True)
 
 
@@ -1108,6 +1099,35 @@ async def key_resend(interaction: discord.Interaction, key: str):
         f"Re-sent to {user.mention}." if ok else f"Couldn't send: {reason}", ephemeral=True)
 
 
+@key_group.command(name="generate", description="Generate a key for a product, bound to a member.")
+@app_commands.describe(member="Who the key is for", product="Which product",
+                       dm="DM the key + file to them (default yes)")
+@app_commands.autocomplete(product=product_autocomplete)
+async def key_generate(interaction: discord.Interaction, member: discord.Member,
+                       product: str, dm: bool = True):
+    if not is_staff(interaction):
+        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        return
+    if get_product(product) is None:
+        await interaction.response.send_message(
+            f"No product named `{product}`. Add it with `/product add`.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    key = generate_key(product)
+    bind_key(key, member.id)
+    invoice_id = generate_invoice_id()
+    record_purchase(invoice_id, member.id, product, key, "admin")
+    await log_event("key_generated", user=member, product=product, key=key,
+                    detail=f"admin-issued by {interaction.user} • invoice {invoice_id}")
+    sent = ""
+    if dm:
+        ok, reason = await send_existing_key(member, get_key(key))
+        sent = "\n\N{WHITE HEAVY CHECK MARK} DMed to them." if ok else f"\n\N{WARNING SIGN} DM failed: {reason}"
+    await interaction.followup.send(
+        f"Generated a **{product}** key bound to {member.mention}:\n`{key}`\n"
+        f"Invoice: `{invoice_id}`{sent}", ephemeral=True)
+
+
 bot.tree.add_command(key_group)
 
 
@@ -1152,13 +1172,23 @@ async def help_cmd(interaction: discord.Interaction):
                   "`/stats` — sales stats", inline=False)
         e.add_field(
             name="Keys (staff)",
-            value="`/key lookup` · `/key revoke` · `/key unrevoke`\n"
+            value="`/key generate` — issue a key bound to a member\n"
+                  "`/key lookup` · `/key revoke` · `/key unrevoke`\n"
                   "`/key resethwid` · `/key resend` · `/keys @user`", inline=False)
     await interaction.response.send_message(embed=e, ephemeral=True)
 
 
 # ===================== Ticket system =====================
-class TicketModal(discord.ui.Modal, title="Open a Support Ticket"):
+# Ticket topics shown as buttons on the panel.
+TICKET_TOPICS = {
+    "sharky_tkt_purchase": ("Purchase", "\N{SHOPPING TROLLEY}", "Purchase / Delivery"),
+    "sharky_tkt_key":      ("Key", "\N{KEY}", "License Key / HWID"),
+    "sharky_tkt_billing":  ("Billing", "\N{CREDIT CARD}", "Billing / Refund"),
+    "sharky_tkt_other":    ("Other", "\N{SPEECH BALLOON}", "Other"),
+}
+
+
+class TicketModal(discord.ui.Modal):
     invoice_id = discord.ui.TextInput(
         label="Invoice ID",
         placeholder="The invoice ID from your purchase (e.g. INV-XXXX-XXXX)",
@@ -1170,18 +1200,42 @@ class TicketModal(discord.ui.Modal, title="Open a Support Ticket"):
         required=False, max_length=1000,
     )
 
+    def __init__(self, topic: str = "Support"):
+        super().__init__(title=f"Open a Ticket — {topic}"[:45])
+        self.topic = topic
+
     async def on_submit(self, interaction: discord.Interaction):
-        await create_ticket(interaction, str(self.invoice_id), str(self.issue))
+        await create_ticket(interaction, str(self.invoice_id), str(self.issue), self.topic)
 
 
 class TicketLauncher(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
+        for cid, (label, emoji, topic) in TICKET_TOPICS.items():
+            self.add_item(TicketTopicButton(cid, label, emoji, topic))
 
-    @discord.ui.button(label="Open Ticket", style=discord.ButtonStyle.primary,
-                       emoji="\N{ADMISSION TICKETS}", custom_id="sharky_open_ticket")
-    async def open_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(TicketModal())
+
+class TicketTopicButton(discord.ui.Button):
+    def __init__(self, custom_id: str, label: str, emoji: str, topic: str):
+        super().__init__(label=label, emoji=emoji,
+                         style=discord.ButtonStyle.secondary, custom_id=custom_id)
+        self.topic = topic
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(TicketModal(self.topic))
+
+
+def ticket_panel_embed() -> discord.Embed:
+    return brand_embed(
+        "\N{ADMISSION TICKETS} Support",
+        "Need a hand? Pick the topic that fits and we'll open a private ticket for you.\n\n"
+        "\N{SHOPPING TROLLEY} **Purchase** — didn't get your product or key\n"
+        "\N{KEY} **Key** — key not working or machine-locked\n"
+        "\N{CREDIT CARD} **Billing** — payment or refund questions\n"
+        "\N{SPEECH BALLOON} **Other** — anything else\n\n"
+        "You'll be asked for your **Invoice ID** so we can verify your purchase. "
+        "One open ticket at a time.",
+    )
 
 
 class TicketControls(discord.ui.View):
@@ -1246,7 +1300,8 @@ async def save_ticket_transcript(channel):
             log.error("Could not post transcript: %s", ex)
 
 
-async def create_ticket(interaction: discord.Interaction, invoice_id: str, issue: str):
+async def create_ticket(interaction: discord.Interaction, invoice_id: str, issue: str,
+                        topic: str = "Support"):
     guild = interaction.guild
     opener = interaction.user
     if guild is None:
@@ -1309,12 +1364,13 @@ async def create_ticket(interaction: discord.Interaction, invoice_id: str, issue
     prod = get_product(purchase.get("product") or "")
     product_label = (prod or {}).get("display_name") or purchase.get("product") or "—"
     embed = brand_embed(
-        f"Ticket #{number:04d}",
+        f"Ticket #{number:04d} — {topic}",
         f"Thanks {opener.mention} — a staff member will be with you shortly.",
     )
-    embed.add_field(name="Invoice", value=f"`{invoice_id}` \N{WHITE HEAVY CHECK MARK} verified", inline=False)
+    embed.add_field(name="Topic", value=topic, inline=True)
     embed.add_field(name="Product", value=product_label, inline=True)
     embed.add_field(name="Purchased", value=(purchase.get("created_at") or "")[:10] or "—", inline=True)
+    embed.add_field(name="Invoice", value=f"`{invoice_id}` \N{WHITE HEAVY CHECK MARK} verified", inline=False)
     if issue.strip():
         embed.add_field(name="Issue", value=issue[:1024], inline=False)
 
