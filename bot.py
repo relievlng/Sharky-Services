@@ -191,6 +191,18 @@ def resolve_log_channel_id():
     return LOG_CHANNEL_ID or None
 
 
+def is_staff(interaction: discord.Interaction) -> bool:
+    """Allow the server owner, anyone with Administrator/Manage Server, or the ADMIN_ROLE."""
+    member = interaction.user
+    guild = interaction.guild
+    if guild is not None and member.id == guild.owner_id:
+        return True
+    perms = getattr(member, "guild_permissions", None)
+    if perms is not None and (perms.administrator or perms.manage_guild):
+        return True
+    return ADMIN_ROLE in [r.name for r in getattr(member, "roles", [])]
+
+
 # ===================== Signed tokens (links / state / claims) =====================
 def _sign(secret: str, msg: str) -> str:
     return hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
@@ -338,7 +350,7 @@ async def deliver(user: discord.abc.User, product: str) -> tuple[bool, str]:
 @app_commands.choices(product=[app_commands.Choice(name=p, value=p) for p in PRODUCTS])
 async def deliver_cmd(interaction: discord.Interaction, member: discord.Member,
                       product: app_commands.Choice[str]):
-    if ADMIN_ROLE not in [r.name for r in getattr(interaction.user, "roles", [])]:
+    if not is_staff(interaction):
         await interaction.response.send_message("You can't use this.", ephemeral=True); return
     await interaction.response.defer(ephemeral=True)
     ok, result = await deliver(member, product.value)
@@ -355,7 +367,7 @@ async def deliver_cmd(interaction: discord.Interaction, member: discord.Member,
 # ---- Slash command: stats ----
 @bot.tree.command(description="Show keys issued and deliveries per product (staff only).")
 async def stats(interaction: discord.Interaction):
-    if ADMIN_ROLE not in [r.name for r in getattr(interaction.user, "roles", [])]:
+    if not is_staff(interaction):
         await interaction.response.send_message("You can't use this.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
@@ -391,7 +403,7 @@ setup_group = app_commands.Group(name="setup", description="Bot setup commands (
 
 @setup_group.command(name="logs", description="Use the current channel for the bot's log feed.")
 async def setup_logs(interaction: discord.Interaction):
-    if ADMIN_ROLE not in [r.name for r in getattr(interaction.user, "roles", [])]:
+    if not is_staff(interaction):
         await interaction.response.send_message("You can't use this.", ephemeral=True)
         return
     channel = interaction.channel
@@ -412,7 +424,7 @@ async def setup_logs(interaction: discord.Interaction):
 
 @setup_group.command(name="status", description="Show what's configured and what's still missing.")
 async def setup_status(interaction: discord.Interaction):
-    if ADMIN_ROLE not in [r.name for r in getattr(interaction.user, "roles", [])]:
+    if not is_staff(interaction):
         await interaction.response.send_message("You can't use this.", ephemeral=True)
         return
     log_id = resolve_log_channel_id()
