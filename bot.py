@@ -633,7 +633,9 @@ async def deliver(user: discord.abc.User, product: str,
     if prod is None:
         await log_event("failed", user=user, product=product, detail="unknown product")
         return False, f"Unknown product: {product}"
-    if not is_linked(user.id):
+    # Website purchases must be OAuth-verified. Staff deliveries are trusted and
+    # always DM, even if the recipient never linked their account.
+    if source == "stripe" and not is_linked(user.id):
         await log_event("failed", user=user, product=product, detail="not linked via oauth")
         return False, "buyer has not linked their Discord account"
 
