@@ -332,6 +332,15 @@ def get_purchase(invoice_id: str):
     return dict(row) if row else None
 
 
+def invoice_for_key(key: str):
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute(
+        "SELECT invoice_id FROM purchases WHERE key = ? ORDER BY created_at DESC LIMIT 1",
+        (key,)).fetchone()
+    con.close()
+    return row[0] if row else None
+
+
 def verify_invoice(invoice_id: str, discord_id: int):
     """
     Check an invoice entered at ticket time.
@@ -1045,6 +1054,10 @@ async def send_existing_key(user: discord.abc.User, row: dict) -> tuple[bool, st
     e = brand_embed("Your License",
                     f"Here's your **{prod.get('display_name') or row['product']}** again. "
                     f"Keep your key private — one key, one user.")
+    inv = invoice_for_key(key)
+    if inv:
+        e.add_field(name="Invoice ID", value=f"`{inv}`", inline=True)
+    e.add_field(name="Product", value=prod.get("display_name") or row["product"], inline=True)
     e.add_field(name="License Key", value=f"```{key}```", inline=False)
     try:
         if fp.exists() and fp.stat().st_size <= ATTACH_LIMIT_BYTES:
