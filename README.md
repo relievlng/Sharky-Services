@@ -31,8 +31,18 @@ bot at OAuth time and only the bot can validate it.
 
 ## Slash commands
 
+- `/setup logs` — staff: use the current channel for the bot's log feed (stored in
+  the DB, overrides the `LOG_CHANNEL_ID` variable so you don't need to set it)
+- `/setup status` — staff: show what's configured and what's still missing
 - `/deliver_cmd member product` — staff manually delivers a product + key
 - `/stats` — staff view of keys issued/delivered per product
+
+## Minimum to run
+
+The bot only needs `DISCORD_TOKEN` to boot. OAuth and Stripe are optional and can be
+added later — until `STRIPE_WEBHOOK_SECRET` is set, the payment webhook simply stays
+idle. Start by setting the token, deploying, then run `/setup logs` in your log
+channel. Wire up OAuth + Stripe whenever you're ready to take payments.
 
 ## Products
 

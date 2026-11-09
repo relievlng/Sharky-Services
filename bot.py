@@ -85,6 +85,7 @@ PRICE_TO_PRODUCT = {
 LOG_COLORS = {
     "key_generated":  0x5865F2,
     "linked":         0x5865F2,
+    "log_setup":      0x57F287,
     "delivered":      0x57F287,
     "delivered_link": 0x57F287,
     "closed_dms":     0xFEE75C,
@@ -117,6 +118,12 @@ def db_init():
             discord_id  INTEGER PRIMARY KEY,
             username    TEXT,
             linked_at   TEXT NOT NULL
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT
         )
     """)
     con.commit(); con.close()
@@ -158,6 +165,30 @@ def is_linked(discord_id: int) -> bool:
     row = con.execute("SELECT 1 FROM links WHERE discord_id = ?", (discord_id,)).fetchone()
     con.close()
     return row is not None
+
+
+def get_setting(key: str):
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    con.close()
+    return row[0] if row else None
+
+
+def set_setting(key: str, value: str):
+    con = sqlite3.connect(DB_PATH)
+    con.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+    con.commit(); con.close()
+
+
+def resolve_log_channel_id():
+    """Log channel set by /setup logs takes priority; else the LOG_CHANNEL_ID env var."""
+    stored = get_setting("log_channel_id")
+    if stored:
+        try:
+            return int(stored)
+        except ValueError:
+            return None
+    return LOG_CHANNEL_ID or None
 
 
 # ===================== Signed tokens (links / state / claims) =====================
@@ -226,11 +257,12 @@ async def log_event(event: str, *, user=None, product=None, key=None, detail=Non
     if detail:  parts.append(f"detail={detail}")
     (log.error if event in ("failed", "webhook_reject") else log.info)(" ".join(parts))
 
-    if not LOG_CHANNEL_ID:
+    channel_id = resolve_log_channel_id()
+    if not channel_id:
         return
-    channel = bot.get_channel(LOG_CHANNEL_ID)
+    channel = bot.get_channel(channel_id)
     if channel is None:
-        log.error("Log channel %s not found", LOG_CHANNEL_ID); return
+        log.error("Log channel %s not found", channel_id); return
     embed = discord.Embed(title=f"Log — {event.replace('_', ' ').title()}",
                           color=LOG_COLORS.get(event, 0x2b2d31),
                           timestamp=datetime.now(timezone.utc))
@@ -351,6 +383,52 @@ async def stats(interaction: discord.Interaction):
     embed.add_field(name="Total Keys", value=str(total_keys), inline=True)
     embed.add_field(name="Linked Accounts", value=str(total_linked), inline=True)
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ---- Slash command group: /setup ----
+setup_group = app_commands.Group(name="setup", description="Bot setup commands (staff only).")
+
+
+@setup_group.command(name="logs", description="Use the current channel for the bot's log feed.")
+async def setup_logs(interaction: discord.Interaction):
+    if ADMIN_ROLE not in [r.name for r in getattr(interaction.user, "roles", [])]:
+        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        return
+    channel = interaction.channel
+    if channel is None:
+        await interaction.response.send_message(
+            "Run this inside the text channel you want logs in.", ephemeral=True)
+        return
+    set_setting("log_channel_id", str(channel.id))
+    await interaction.response.send_message(
+        f"Done. Logs will now post in {channel.mention}. "
+        f"This overrides the LOG_CHANNEL_ID variable, so you don't need to set it.",
+        ephemeral=True)
+    # Post a confirmation entry into the newly chosen channel as a live test.
+    await log_event("log_setup",
+                    detail=f"Log channel set to #{getattr(channel, 'name', channel.id)} "
+                           f"by {interaction.user}")
+
+
+@setup_group.command(name="status", description="Show what's configured and what's still missing.")
+async def setup_status(interaction: discord.Interaction):
+    if ADMIN_ROLE not in [r.name for r in getattr(interaction.user, "roles", [])]:
+        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        return
+    log_id = resolve_log_channel_id()
+    lines = [
+        f"**Logs:** {'<#' + str(log_id) + '>' if log_id else 'not set — run `/setup logs`'}",
+        f"**OAuth login:** {'configured' if OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET else 'not set'}",
+        f"**Public URL:** {PUBLIC_BASE_URL or 'not set'}",
+        f"**Stripe payments:** {'configured' if STRIPE_WEBHOOK_SECRET else 'not set (set up later)'}",
+    ]
+    embed = discord.Embed(title="Setup Status", color=0x5865F2,
+                          description="\n".join(lines),
+                          timestamp=datetime.now(timezone.utc))
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+bot.tree.add_command(setup_group)
 
 
 # ===================== HTTP handlers =====================
