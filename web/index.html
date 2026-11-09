@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="description" content="Sharky Macro — automated fishing and metal detecting for the Logic FiveM server. Day, week, month and lifetime passes.">
+<title>Sharky Macro</title>
+<style>
+  /* Layout: single-column editorial scroll — sticky nav, animated hero over canvas,
+     mock macro dashboard, feature grid, duration pricing, step flow, FAQ, CTA.
+     Committed dark "deep-water" world (single theme by design). */
+  :root{
+    --bg:#05070e;
+    --bg-grad-1:#071325;
+    --bg-grad-2:#05070e;
+    --panel:#0b1320;
+    --panel-2:#0e1828;
+    --line:rgba(130,170,220,.12);
+    --line-2:rgba(130,170,220,.22);
+    --fg:#e9f0fa;
+    --muted:#92a5c0;
+    --faint:#5e708c;
+    --accent:#28e0f0;      /* electric aqua */
+    --accent-2:#3b7cff;    /* deep blue */
+    --accent-ink:#04121a;
+    --good:#34d399;
+    --warn:#fbbf24;
+    --glow:0 0 40px rgba(40,224,240,.35);
+    --radius:16px;
+    --font-display:"Chakra Petch",system-ui,sans-serif;
+    --font-body:"Sora",system-ui,sans-serif;
+    --font-mono:"JetBrains Mono",ui-monospace,monospace;
+    color-scheme:dark;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  @media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+  html,body{margin:0}
+  body{
+    background:
+      radial-gradient(1200px 700px at 72% -10%, rgba(40,224,240,.10), transparent 60%),
+      radial-gradient(900px 600px at 10% 0%, rgba(59,124,255,.12), transparent 55%),
+      linear-gradient(180deg,var(--bg-grad-1),var(--bg-grad-2) 40%);
+    color:var(--fg);
+    font-family:var(--font-body);
+    line-height:1.6;
+    -webkit-font-smoothing:antialiased;
+    overflow-x:hidden;
+  }
+  a{color:inherit;text-decoration:none}
+  h1,h2,h3{font-family:var(--font-display);font-weight:600;line-height:1.05;text-wrap:balance;margin:0}
+  p{margin:0}
+  .wrap{width:100%;max-width:1140px;margin-inline:auto;
+    padding-left:max(20px,env(safe-area-inset-left,0px));
+    padding-right:max(20px,env(safe-area-inset-right,0px));}
+  .eyebrow{font-family:var(--font-mono);font-size:.72rem;letter-spacing:.28em;text-transform:uppercase;color:var(--accent);display:inline-flex;align-items:center;gap:.6em}
+  .eyebrow::before{content:"";width:22px;height:1px;background:var(--accent);opacity:.7}
+  .btn{display:inline-flex;align-items:center;gap:.5em;font-family:var(--font-display);font-weight:600;font-size:.95rem;letter-spacing:.02em;padding:.8em 1.4em;border-radius:12px;border:1px solid transparent;cursor:pointer;transition:transform .15s ease,box-shadow .2s ease,background .2s ease,border-color .2s}
+  .btn:active{transform:translateY(1px)}
+  .btn-primary{background:linear-gradient(135deg,var(--accent),var(--accent-2));color:var(--accent-ink);box-shadow:var(--glow)}
+  .btn-primary:hover{box-shadow:0 0 56px rgba(40,224,240,.5);transform:translateY(-2px)}
+  .btn-ghost{background:rgba(130,170,220,.06);color:var(--fg);border-color:var(--line-2)}
+  .btn-ghost:hover{border-color:var(--accent);color:var(--accent)}
+
+  /* safe-area top band */
+  body::before{content:"";position:fixed;inset:0 0 auto;height:env(safe-area-inset-top,0px);z-index:60;background:rgba(5,7,14,.9);backdrop-filter:blur(8px)}
+
+  /* ---- Nav ---- */
+  header.nav{position:sticky;top:env(safe-area-inset-top,0px);z-index:50;backdrop-filter:blur(12px);background:linear-gradient(180deg,rgba(5,7,14,.86),rgba(5,7,14,.5));border-bottom:1px solid var(--line)}
+  .nav-inner{display:flex;align-items:center;justify-content:space-between;gap:1rem;padding-block:14px}
+  .brand{display:flex;align-items:center;gap:.6rem;font-family:var(--font-display);font-weight:700;font-size:1.15rem;letter-spacing:.02em}
+  .brand .fin{width:30px;height:30px;display:grid;place-items:center;border-radius:9px;background:linear-gradient(135deg,var(--accent),var(--accent-2));color:var(--accent-ink);box-shadow:var(--glow)}
+  .nav-links{display:flex;align-items:center;gap:1.6rem}
+  .nav-links a{font-size:.92rem;color:var(--muted);transition:color .15s}
+  .nav-links a:hover{color:var(--fg)}
+  .nav-cta{display:flex;align-items:center;gap:.7rem}
+  .menu-btn{display:none;background:none;border:1px solid var(--line-2);border-radius:10px;color:var(--fg);padding:.5em .6em;cursor:pointer}
+  @media (max-width:860px){
+    .nav-links{position:absolute;top:100%;left:0;right:0;flex-direction:column;align-items:stretch;gap:0;background:var(--panel);border-bottom:1px solid var(--line);padding:8px max(20px,env(safe-area-inset-left,0px));}
+    .nav-links a{padding:.9em 0;border-bottom:1px solid var(--line)}
+    .nav-links[hidden]{display:none}
+    .menu-btn{display:inline-flex}
+    .nav-cta .btn-ghost{display:none}
+  }
+
+  /* ---- Hero ---- */
+  .hero{position:relative;overflow:hidden}
+  #bubbles{position:absolute;inset:0;width:100%;height:100%;z-index:0}
+  .hero .wrap{position:relative;z-index:1;padding-block:72px 40px;display:grid;grid-template-columns:1.1fr .9fr;gap:52px;align-items:center}
+  .hero h1{font-size:clamp(2.6rem,6vw,4.6rem);letter-spacing:-.01em}
+  .hero h1 em{font-style:italic;color:var(--accent);text-shadow:var(--glow)}
+  .hero .sub{color:var(--muted);font-size:1.12rem;margin-top:1.2rem;max-width:34ch}
+  .hero-cta{display:flex;gap:.9rem;margin-top:2rem;flex-wrap:wrap}
+  .hero-tags{display:flex;gap:1.3rem;margin-top:2.2rem;flex-wrap:wrap;color:var(--faint);font-family:var(--font-mono);font-size:.76rem;letter-spacing:.04em}
+  .hero-tags span{display:flex;align-items:center;gap:.5em}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--accent);box-shadow:0 0 10px var(--accent)}
+  @media (max-width:860px){.hero .wrap{grid-template-columns:1fr;gap:34px;padding-block:44px 24px}}
+
+  /* mock app */
+  .app{position:relative;border:1px solid var(--line-2);border-radius:20px;background:linear-gradient(180deg,var(--panel-2),var(--panel));box-shadow:0 30px 80px -30px rgba(0,0,0,.8),inset 0 1px 0 rgba(255,255,255,.04);overflow:hidden}
+  .app-bar{display:flex;align-items:center;gap:.5rem;padding:12px 14px;border-bottom:1px solid var(--line)}
+  .app-bar .lights{display:flex;gap:6px}
+  .app-bar .lights i{width:10px;height:10px;border-radius:50%;background:#2a3850}
+  .app-bar .title{font-family:var(--font-mono);font-size:.72rem;color:var(--muted);margin-left:.4rem;letter-spacing:.06em}
+  .app-bar .pin{margin-left:auto;font-family:var(--font-mono);font-size:.66rem;color:var(--accent);border:1px solid var(--line-2);border-radius:6px;padding:.2em .5em}
+  .app-body{padding:16px;display:grid;gap:12px}
+  .mode{display:flex;align-items:center;gap:12px;padding:12px;border:1px solid var(--line);border-radius:12px;background:rgba(130,170,220,.03)}
+  .mode .ic{width:38px;height:38px;border-radius:10px;display:grid;place-items:center;font-size:1.1rem;background:rgba(40,224,240,.1);border:1px solid var(--line-2)}
+  .mode .meta{flex:1;min-width:0}
+  .mode .meta b{font-family:var(--font-display);font-weight:600}
+  .mode .meta small{display:block;color:var(--muted);font-size:.78rem}
+  .mode.active{border-color:var(--accent);box-shadow:0 0 0 1px rgba(40,224,240,.25),0 0 30px -8px rgba(40,224,240,.4)}
+  .toggle{width:42px;height:24px;border-radius:999px;background:#1a2740;position:relative;flex:none;border:1px solid var(--line-2)}
+  .toggle.on{background:linear-gradient(135deg,var(--accent),var(--accent-2))}
+  .toggle::after{content:"";position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:#dff;transition:left .2s}
+  .toggle.on::after{left:20px}
+  .hotrow{display:flex;gap:8px;flex-wrap:wrap;font-family:var(--font-mono);font-size:.72rem;color:var(--muted)}
+  .key{border:1px solid var(--line-2);border-bottom-width:2px;border-radius:6px;padding:.25em .55em;color:var(--fg);background:rgba(130,170,220,.05)}
+
+  /* ---- generic section ---- */
+  section{position:relative}
+  .band{padding-block:72px}
+  .sec-head{max-width:60ch;margin-bottom:40px}
+  .sec-head h2{font-size:clamp(1.9rem,4vw,2.8rem);margin-top:.6rem}
+  .sec-head p{color:var(--muted);margin-top:.9rem;font-size:1.05rem}
+
+  /* features */
+  .feat-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:18px}
+  .card{border:1px solid var(--line);border-radius:var(--radius);background:linear-gradient(180deg,rgba(130,170,220,.04),transparent);padding:24px;transition:border-color .2s,transform .2s}
+  .card:hover{border-color:var(--line-2);transform:translateY(-3px)}
+  .card .ic{width:44px;height:44px;border-radius:12px;display:grid;place-items:center;font-size:1.3rem;background:rgba(40,224,240,.08);border:1px solid var(--line-2);margin-bottom:16px}
+  .card h3{font-size:1.2rem;margin-bottom:.5rem}
+  .card p{color:var(--muted);font-size:.95rem}
+  .card ul{margin:.9rem 0 0;padding:0;list-style:none;display:grid;gap:.5rem}
+  .card li{display:flex;gap:.6em;color:var(--muted);font-size:.9rem}
+  .card li::before{content:"▹";color:var(--accent)}
+  .mini{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;margin-top:18px}
+  .mini .card{padding:20px}
+  .mini .card h3{font-size:1rem}
+  @media (max-width:760px){.feat-grid,.mini{grid-template-columns:1fr}}
+
+  /* pricing */
+  .price-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
+  .plan{border:1px solid var(--line);border-radius:var(--radius);background:var(--panel);padding:24px;display:flex;flex-direction:column;gap:14px;position:relative;transition:transform .2s,border-color .2s,box-shadow .2s}
+  .plan:hover{transform:translateY(-4px);border-color:var(--line-2)}
+  .plan.feature{border-color:var(--accent);box-shadow:0 0 0 1px rgba(40,224,240,.3),0 24px 60px -30px rgba(40,224,240,.5)}
+  .plan .tag{font-family:var(--font-mono);font-size:.68rem;letter-spacing:.2em;text-transform:uppercase;color:var(--muted)}
+  .plan.feature .tag{color:var(--accent)}
+  .ribbon{position:absolute;top:-11px;right:16px;font-family:var(--font-mono);font-size:.62rem;letter-spacing:.14em;text-transform:uppercase;background:linear-gradient(135deg,var(--accent),var(--accent-2));color:var(--accent-ink);padding:.3em .7em;border-radius:999px}
+  .price{font-family:var(--font-display);font-weight:700;font-size:2.3rem;line-height:1;display:flex;align-items:baseline;gap:.15em}
+  .price small{font-size:.8rem;font-weight:400;color:var(--muted);font-family:var(--font-body)}
+  .plan .dur{color:var(--muted);font-size:.85rem;margin-top:-6px}
+  .plan ul{list-style:none;margin:0;padding:0;display:grid;gap:.55rem}
+  .plan li{display:flex;gap:.6em;font-size:.88rem;color:var(--muted)}
+  .plan li::before{content:"✓";color:var(--good);font-weight:700}
+  .plan .btn{margin-top:auto;justify-content:center}
+  @media (max-width:980px){.price-grid{grid-template-columns:repeat(2,1fr)}}
+  @media (max-width:520px){.price-grid{grid-template-columns:1fr}}
+  .price-note{color:var(--faint);font-size:.82rem;margin-top:18px;font-family:var(--font-mono)}
+
+  /* steps */
+  .steps{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;counter-reset:s}
+  .step{border:1px solid var(--line);border-radius:var(--radius);padding:24px;background:linear-gradient(180deg,rgba(130,170,220,.03),transparent)}
+  .step .n{counter-increment:s;font-family:var(--font-mono);font-size:.8rem;color:var(--accent);letter-spacing:.1em}
+  .step .n::before{content:"0" counter(s)}
+  .step h3{font-size:1.15rem;margin:.6rem 0 .5rem}
+  .step p{color:var(--muted);font-size:.92rem}
+  @media (max-width:760px){.steps{grid-template-columns:1fr}}
+
+  /* faq */
+  .faq{display:grid;gap:10px;max-width:820px}
+  details{border:1px solid var(--line);border-radius:12px;background:var(--panel);overflow:hidden}
+  details[open]{border-color:var(--line-2)}
+  summary{cursor:pointer;list-style:none;padding:18px 20px;font-family:var(--font-display);font-weight:600;display:flex;justify-content:space-between;align-items:center;gap:1rem}
+  summary::-webkit-details-marker{display:none}
+  summary::after{content:"+";color:var(--accent);font-size:1.3rem;transition:transform .2s}
+  details[open] summary::after{transform:rotate(45deg)}
+  details p{padding:0 20px 20px;color:var(--muted);font-size:.95rem}
+
+  /* cta */
+  .cta-box{border:1px solid var(--line-2);border-radius:24px;padding:48px;text-align:center;background:
+      radial-gradient(600px 300px at 50% -40%,rgba(40,224,240,.18),transparent 70%),
+      linear-gradient(180deg,var(--panel-2),var(--panel));position:relative;overflow:hidden}
+  .cta-box h2{font-size:clamp(1.8rem,4vw,2.6rem)}
+  .cta-box p{color:var(--muted);margin:.8rem auto 1.8rem;max-width:46ch}
+  .cta-box .hero-cta{justify-content:center}
+
+  /* footer */
+  footer{border-top:1px solid var(--line);margin-top:20px}
+  .foot{display:flex;justify-content:space-between;gap:24px;flex-wrap:wrap;padding-block:36px;color:var(--muted);font-size:.86rem}
+  .foot .brand{font-size:1rem}
+  .foot a{color:var(--muted)}
+  .foot a:hover{color:var(--accent)}
+  .disc{color:var(--faint);font-size:.76rem;max-width:52ch;margin-top:10px}
+
+  :focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:6px}
+</style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chakra+Petch:ital,wght@0,500;0,600;0,700;1,600&family=Sora:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+</head>
+<body>
+<header class="nav">
+  <div class="wrap nav-inner">
+    <a class="brand" href="#home"><span class="fin">◣</span> Sharky<span style="color:var(--accent)">Macro</span></a>
+    <nav class="nav-links" id="navlinks">
+      <a href="#features">Features</a>
+      <a href="#pricing">Pricing</a>
+      <a href="#how">How it works</a>
+      <a href="#faq">FAQ</a>
+    </nav>
+    <div class="nav-cta">
+      <a class="btn btn-ghost" href="https://sharky-services-production.up.railway.app/login">My account</a>
+      <a class="btn btn-primary" href="#pricing">Get a pass</a>
+      <button class="menu-btn" id="menuBtn" aria-label="Menu" aria-expanded="false">☰</button>
+    </div>
+  </div>
+</header>
+
+<main>
+  <!-- HERO -->
+  <section class="hero" id="home">
+    <canvas id="bubbles" aria-hidden="true"></canvas>
+    <div class="wrap">
+      <div>
+        <span class="eyebrow">Built for Logic · Windows</span>
+        <h1>Less grind.<br>More <em>play.</em></h1>
+        <p class="sub">Sharky Macro runs the repetitive loops for you — fishing and metal detecting on Logic — so you keep the progress and skip the busywork.</p>
+        <div class="hero-cta">
+          <a class="btn btn-primary" href="#pricing">Find your pass →</a>
+          <a class="btn btn-ghost" href="#features">Explore the tools</a>
+        </div>
+        <div class="hero-tags">
+          <span><i class="dot"></i> One key, one PC</span>
+          <span><i class="dot"></i> Keys delivered in Discord</span>
+          <span><i class="dot"></i> Always-on-top window</span>
+        </div>
+      </div>
+      <!-- mock app -->
+      <div class="app" aria-hidden="true">
+        <div class="app-bar">
+          <span class="lights"><i></i><i></i><i></i></span>
+          <span class="title">SHARKY · logic workspace</span>
+          <span class="pin">◎ always on top</span>
+        </div>
+        <div class="app-body">
+          <div class="mode active">
+            <div class="ic">🎣</div>
+            <div class="meta"><b>Fishing</b><small>Cast · keep (E) · release (R) · rod slot 3</small></div>
+            <div class="toggle on"></div>
+          </div>
+          <div class="mode">
+            <div class="ic">📡</div>
+            <div class="meta"><b>Metal detecting</b><small>Detector slot 1–5 · skill-check handler</small></div>
+            <div class="toggle"></div>
+          </div>
+          <div class="hotrow">
+            <span class="key">F6</span> start / pause
+            <span class="key">F7</span> stop
+            <span class="key">drag</span> move window
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- FEATURES -->
+  <section class="band" id="features">
+    <div class="wrap">
+      <div class="sec-head">
+        <span class="eyebrow">The toolkit</span>
+        <h2>Two macros. One clean window.</h2>
+        <p>Both modes come with every pass. Pick a mode, set your slots, and let it run while you do something else.</p>
+      </div>
+      <div class="feat-grid">
+        <div class="card">
+          <div class="ic">🎣</div>
+          <h3>Fishing</h3>
+          <p>A full automated cast-and-collect cycle tuned for Logic.</p>
+          <ul>
+            <li>Auto cast, track, and collect</li>
+            <li>Keep fish with E, release with R on the full-pockets warning</li>
+            <li>Choose your rod slot</li>
+          </ul>
+        </div>
+        <div class="card">
+          <div class="ic">📡</div>
+          <h3>Metal detecting</h3>
+          <p>Scans, handles the skill check, and loops until you stop it.</p>
+          <ul>
+            <li>Pick detector slot 1–5</li>
+            <li>Search + skill-check handling</li>
+            <li>Repeat loop with a clean stop</li>
+          </ul>
+        </div>
+      </div>
+      <div class="mini">
+        <div class="card"><div class="ic">⌨️</div><h3>Hotkey control</h3><p>F6 to start or pause, F7 to stop. No alt-tabbing mid-run.</p></div>
+        <div class="card"><div class="ic">📌</div><h3>Always on top</h3><p>A small draggable window you can pin over the game.</p></div>
+        <div class="card"><div class="ic">🔑</div><h3>Key activation</h3><p>Your license unlocks it and locks to one machine.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- PRICING -->
+  <section class="band" id="pricing">
+    <div class="wrap">
+      <div class="sec-head">
+        <span class="eyebrow">Pick your pace</span>
+        <h2>Passes that match how you play.</h2>
+        <p>Every pass includes both macros. Prices in AUD, one device per license. Grab a day to try it or go lifetime.</p>
+      </div>
+      <div class="price-grid">
+        <div class="plan">
+          <span class="tag">Day</span>
+          <div class="price">$4<small>.99</small></div>
+          <div class="dur">24 hours of access</div>
+          <ul><li>Both macros</li><li>One device</li><li>Instant Discord delivery</li></ul>
+          <a class="btn btn-ghost" href="https://sharky-services-production.up.railway.app/login">Get Day</a>
+        </div>
+        <div class="plan">
+          <span class="tag">Week</span>
+          <div class="price">$9<small>.99</small></div>
+          <div class="dur">7 days of access</div>
+          <ul><li>Both macros</li><li>One device</li><li>Instant Discord delivery</li></ul>
+          <a class="btn btn-ghost" href="https://sharky-services-production.up.railway.app/login">Get Week</a>
+        </div>
+        <div class="plan feature">
+          <span class="ribbon">Most popular</span>
+          <span class="tag">Month</span>
+          <div class="price">$19<small>.99</small></div>
+          <div class="dur">30 days of access</div>
+          <ul><li>Both macros</li><li>One device</li><li>Priority support ticket</li></ul>
+          <a class="btn btn-primary" href="https://sharky-services-production.up.railway.app/login">Get Month</a>
+        </div>
+        <div class="plan">
+          <span class="tag">Lifetime</span>
+          <div class="price">$49<small>.99</small></div>
+          <div class="dur">No scheduled expiry</div>
+          <ul><li>Both macros</li><li>One device</li><li>Every future update</li></ul>
+          <a class="btn btn-ghost" href="https://sharky-services-production.up.railway.app/login">Get Lifetime</a>
+        </div>
+      </div>
+      <p class="price-note">Lifetime means no scheduled expiry — not a promise of perpetual service or game compatibility.</p>
+    </div>
+  </section>
+
+  <!-- HOW -->
+  <section class="band" id="how">
+    <div class="wrap">
+      <div class="sec-head">
+        <span class="eyebrow">From key to session</span>
+        <h2>Up and running in three steps.</h2>
+      </div>
+      <div class="steps">
+        <div class="step">
+          <span class="n"></span>
+          <h3>Sign in with Discord</h3>
+          <p>Verify who you are in one click. Your key and product get tied to your Discord account.</p>
+        </div>
+        <div class="step">
+          <span class="n"></span>
+          <h3>Pick a pass</h3>
+          <p>Choose Day, Week, Month, or Lifetime. The bot DMs you your license key and the download the moment it's paid.</p>
+        </div>
+        <div class="step">
+          <span class="n"></span>
+          <h3>Activate & play</h3>
+          <p>Open the app, paste your key, pick a mode, and hit F6. The key locks to your machine.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- FAQ -->
+  <section class="band" id="faq">
+    <div class="wrap">
+      <div class="sec-head">
+        <span class="eyebrow">A few things to know</span>
+        <h2>Questions, answered.</h2>
+      </div>
+      <div class="faq">
+        <details open><summary>Which server does it support?</summary><p>Sharky Macro is built for the Logic FiveM server. Fishing and metal detecting are tuned specifically for it.</p></details>
+        <details><summary>What do I need to run it?</summary><p>A Windows PC. The app is a small desktop tool with a draggable, always-on-top window and F6 / F7 hotkeys.</p></details>
+        <details><summary>How is my key delivered?</summary><p>Straight to your Discord DMs. After you sign in and get a pass, the bot sends your license key, invoice ID, and the download instantly.</p></details>
+        <details><summary>Can I move it to a new PC?</summary><p>Each license locks to one machine. If you change computers, open a ticket in Discord and staff can reset the machine lock on your key.</p></details>
+        <details><summary>Is this affiliated with the game or server?</summary><p>No. Sharky Macro is an independent tool and isn't endorsed by or affiliated with FiveM or any server. Use it at your own discretion.</p></details>
+      </div>
+    </div>
+  </section>
+
+  <!-- CTA -->
+  <section class="band">
+    <div class="wrap">
+      <div class="cta-box">
+        <span class="eyebrow" style="justify-content:center">Ready when you are</span>
+        <h2>Stop grinding. Start fishing.</h2>
+        <p>Sign in with Discord, grab a pass, and your key lands in your DMs. It's that quick.</p>
+        <div class="hero-cta">
+          <a class="btn btn-primary" href="#pricing">Get your pass →</a>
+          <a class="btn btn-ghost" href="https://sharky-services-production.up.railway.app/login">Sign in</a>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap foot">
+    <div>
+      <div class="brand"><span class="fin">◣</span> SharkyMacro</div>
+      <p class="disc">An independent automation tool for the Logic FiveM server. Not affiliated with or endorsed by FiveM or any game server. One license covers one device.</p>
+    </div>
+    <div style="display:flex;gap:2.4rem;flex-wrap:wrap">
+      <div style="display:grid;gap:.5rem">
+        <a href="#features">Features</a>
+        <a href="#pricing">Pricing</a>
+        <a href="#how">How it works</a>
+      </div>
+      <div style="display:grid;gap:.5rem">
+        <a href="#faq">FAQ</a>
+        <a href="https://sharky-services-production.up.railway.app/login">My account</a>
+      </div>
+    </div>
+  </div>
+</footer>
+
+<script>
+  // Mobile menu
+  (function(){
+    var btn=document.getElementById('menuBtn'), links=document.getElementById('navlinks');
+    function closed(){ return window.matchMedia('(max-width:860px)').matches; }
+    if(closed()) links.hidden=true;
+    window.addEventListener('resize',function(){ if(!closed()) links.hidden=false; else if(btn.getAttribute('aria-expanded')!=='true') links.hidden=true; });
+    btn.addEventListener('click',function(){
+      var open=links.hidden;
+      links.hidden=!open;
+      btn.setAttribute('aria-expanded', open?'true':'false');
+    });
+    links.addEventListener('click',function(e){ if(e.target.tagName==='A'&&closed()){ links.hidden=true; btn.setAttribute('aria-expanded','false'); }});
+  })();
+
+  // Rising-bubble canvas (reduced-motion aware)
+  (function(){
+    var c=document.getElementById('bubbles'); if(!c) return;
+    var reduce=window.matchMedia('(prefers-reduced-motion:reduce)').matches;
+    var ctx=c.getContext('2d'), w,h,dpr, bubbles=[], raf;
+    function size(){
+      dpr=Math.min(window.devicePixelRatio||1,2);
+      var host=c.parentElement; w=host.clientWidth; h=host.clientHeight;
+      c.width=w*dpr; c.height=h*dpr; ctx.setTransform(dpr,0,0,dpr,0,0);
+    }
+    function make(){
+      var n=Math.max(16,Math.round(w/44));
+      bubbles=[];
+      for(var i=0;i<n;i++) bubbles.push({
+        x:Math.random()*w, y:Math.random()*h,
+        r:1+Math.random()*3.4, s:.15+Math.random()*.5, d:Math.random()*Math.PI*2,
+        a:.1+Math.random()*.35
+      });
+    }
+    function frame(){
+      ctx.clearRect(0,0,w,h);
+      for(var i=0;i<bubbles.length;i++){
+        var b=bubbles[i];
+        b.y-=b.s; b.d+=0.01; b.x+=Math.sin(b.d)*.3;
+        if(b.y< -8){ b.y=h+8; b.x=Math.random()*w; }
+        ctx.beginPath();
+        ctx.arc(b.x,b.y,b.r,0,Math.PI*2);
+        ctx.fillStyle='rgba(40,224,240,'+b.a+')';
+        ctx.fill();
+      }
+      raf=requestAnimationFrame(frame);
+    }
+    function start(){ size(); make(); if(!reduce){ cancelAnimationFrame(raf); frame(); } else { // draw one static frame
+        ctx.clearRect(0,0,w,h); for(var i=0;i<bubbles.length;i++){var b=bubbles[i];ctx.beginPath();ctx.arc(b.x,b.y,b.r,0,Math.PI*2);ctx.fillStyle='rgba(40,224,240,'+b.a+')';ctx.fill();} } }
+    var t; window.addEventListener('resize',function(){ clearTimeout(t); t=setTimeout(start,150); });
+    start();
+  })();
+</script>
+</body>
+</html>

@@ -122,6 +122,9 @@ LOG_COLORS = {
     "role_change":    0x5865F2,
     "channel_change": 0x5865F2,
     "nick_change":    0x5865F2,
+    "automod":        0xED4245,
+    "mod_action":     0xE67E22,
+    "warn":           0xFEE75C,
 }
 
 # Which saved log channel each event goes to. Missing -> general feed.
@@ -136,6 +139,7 @@ LOG_ROUTES = {
     "member_join": "log_server", "member_leave": "log_server", "member_ban": "log_server",
     "member_unban": "log_server", "msg_delete": "log_server", "msg_edit": "log_server",
     "role_change": "log_server", "channel_change": "log_server", "nick_change": "log_server",
+    "automod": "log_server", "mod_action": "log_server", "warn": "log_server",
 }
 
 # ===================== Logging =====================
@@ -199,6 +203,16 @@ def db_init():
             filename     TEXT,
             price_id     TEXT,
             created_at   TEXT NOT NULL
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS warnings (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id    INTEGER,
+            user_id     INTEGER,
+            mod_id      INTEGER,
+            reason      TEXT,
+            created_at  TEXT NOT NULL
         )
     """)
     # Migration-safe column adds for existing databases.
@@ -553,6 +567,21 @@ def is_staff(interaction: discord.Interaction) -> bool:
     return bool(rid) and any(r.id == rid for r in member_roles)
 
 
+def member_is_staff(member: discord.Member) -> bool:
+    """Staff check for a Member object (automod exemption)."""
+    guild = getattr(member, "guild", None)
+    if guild is not None and member.id == guild.owner_id:
+        return True
+    perms = getattr(member, "guild_permissions", None)
+    if perms is not None and (perms.administrator or perms.manage_guild or perms.manage_messages):
+        return True
+    roles = getattr(member, "roles", [])
+    if ADMIN_ROLE in [r.name for r in roles]:
+        return True
+    rid = _as_int(get_setting("staff_role_id"))
+    return bool(rid) and any(r.id == rid for r in roles)
+
+
 def brand_embed(title: str, description: str = None, color: int = None) -> discord.Embed:
     """A dark, clean embed branded with the logo as a circular icon (no big white image)."""
     e = discord.Embed(title=title, description=description,
@@ -607,6 +636,35 @@ def ticket_opener(channel_id: int):
     row = con.execute("SELECT opener_id FROM tickets WHERE channel_id = ?", (channel_id,)).fetchone()
     con.close()
     return row[0] if row else None
+
+
+def add_warning(guild_id: int, user_id: int, mod_id: int, reason: str) -> int:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.execute(
+        "INSERT INTO warnings (guild_id, user_id, mod_id, reason, created_at) VALUES (?, ?, ?, ?, ?)",
+        (guild_id, user_id, mod_id, reason, datetime.now(timezone.utc).isoformat()))
+    con.commit()
+    count = con.execute("SELECT COUNT(*) FROM warnings WHERE guild_id=? AND user_id=?",
+                        (guild_id, user_id)).fetchone()[0]
+    con.close()
+    return count
+
+
+def list_warnings(guild_id: int, user_id: int):
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    rows = con.execute(
+        "SELECT * FROM warnings WHERE guild_id=? AND user_id=? ORDER BY id DESC",
+        (guild_id, user_id)).fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+
+def clear_warnings(guild_id: int, user_id: int) -> int:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.execute("DELETE FROM warnings WHERE guild_id=? AND user_id=?", (guild_id, user_id))
+    con.commit(); n = cur.rowcount; con.close()
+    return n
 
 
 # ===================== Signed tokens (links / state / claims) =====================
@@ -1010,6 +1068,72 @@ async def setup_staffrole(interaction: discord.Interaction, role: discord.Role):
         ephemeral=True)
 
 
+@setup_group.command(name="automod", description="Toggle automod: invite links, spam, and mass mentions.")
+@app_commands.describe(invites="Delete Discord invite links",
+                       spam="Timeout users sending messages too fast",
+                       mentions="Delete + timeout mass-mention messages")
+async def setup_automod(interaction: discord.Interaction, invites: bool = None,
+                        spam: bool = None, mentions: bool = None):
+    if not is_staff(interaction):
+        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        return
+    changed = []
+    for name, val in (("automod_invites", invites), ("automod_spam", spam), ("automod_mentions", mentions)):
+        if val is not None:
+            set_setting(name, "1" if val else "0")
+            changed.append(f"{name.split('_')[1]} {'on' if val else 'off'}")
+    if not changed:
+        state = {n: get_setting("automod_" + n) == "1"
+                 for n in ("invites", "spam", "mentions")}
+        lines = "\n".join(f"**{k.title()}:** {'on' if v else 'off'}" for k, v in state.items())
+        await interaction.response.send_message(embed=brand_embed("Automod", lines), ephemeral=True)
+        return
+    note = "" if SERVER_LOGS else ("\n\N{WARNING SIGN} Invite/spam filters need message content: set "
+                                   "`SERVER_LOGS=1` and enable the **Message Content Intent**.")
+    await interaction.response.send_message("Automod updated: " + ", ".join(changed) + note, ephemeral=True)
+
+
+@setup_group.command(name="welcome", description="Set the welcome channel and message for new members.")
+@app_commands.describe(channel="Where to post welcomes",
+                       message="Message. Use {user} {server} {count}. Leave blank for a default.",
+                       also_dm="Also DM the new member (default no)")
+async def setup_welcome(interaction: discord.Interaction, channel: discord.TextChannel,
+                        message: str = None, also_dm: bool = False):
+    if not is_staff(interaction):
+        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        return
+    set_setting("welcome_channel_id", str(channel.id))
+    if message:
+        set_setting("welcome_message", message)
+    set_setting("welcome_dm", "1" if also_dm else "0")
+    note = "" if SERVER_LOGS else ("\n\N{WARNING SIGN} Set `SERVER_LOGS=1` and enable the "
+                                   "**Server Members Intent** so the bot sees joins.")
+    await interaction.response.send_message(
+        f"Welcomes will post in {channel.mention}{' and DM new members' if also_dm else ''}.{note}",
+        ephemeral=True)
+
+
+@setup_group.command(name="verify", description="Post a verification panel; the button grants a role.")
+@app_commands.describe(role="Role to give when someone verifies")
+async def setup_verify(interaction: discord.Interaction, role: discord.Role):
+    if not is_staff(interaction):
+        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        return
+    if role >= interaction.guild.me.top_role:
+        await interaction.response.send_message(
+            "That role is above my highest role, so I can't assign it. Move my bot role above it first.",
+            ephemeral=True)
+        return
+    set_setting("verified_role_id", str(role.id))
+    embed = brand_embed(
+        "\N{WHITE HEAVY CHECK MARK} Verification",
+        f"Click the button below to verify and unlock the rest of the server. "
+        f"You'll get the {role.mention} role.")
+    await interaction.channel.send(embed=embed, view=VerifyView())
+    await interaction.response.send_message(
+        f"Verification panel posted. Verified members get {role.mention}.", ephemeral=True)
+
+
 @setup_group.command(name="tickets", description="Post the support ticket panel in this channel.")
 async def setup_tickets(interaction: discord.Interaction):
     if not is_staff(interaction):
@@ -1350,6 +1474,63 @@ def ticket_panel_embed() -> discord.Embed:
     )
 
 
+# ===================== Welcome + verification =====================
+def format_welcome(template: str, member: discord.Member) -> str:
+    t = template or "Welcome {user} to **{server}**! You're member #{count}. \N{WAVING HAND SIGN}"
+    return (t.replace("{user}", member.mention)
+             .replace("{server}", member.guild.name)
+             .replace("{count}", str(member.guild.member_count or "")))
+
+
+async def send_welcome(member: discord.Member):
+    if member.bot:
+        return
+    wid = _as_int(get_setting("welcome_channel_id"))
+    channel = bot.get_channel(wid) if wid else None
+    if channel:
+        try:
+            e = brand_embed(f"Welcome, {member.display_name}!",
+                            format_welcome(get_setting("welcome_message"), member))
+            e.set_thumbnail(url=member.display_avatar.url)
+            await channel.send(content=member.mention, embed=e)
+        except discord.HTTPException:
+            pass
+    if get_setting("welcome_dm") == "1":
+        try:
+            await member.send(embed=brand_embed(
+                f"Welcome to {member.guild.name}!",
+                format_welcome(get_setting("welcome_message"), member)))
+        except discord.HTTPException:
+            pass
+
+
+class VerifyView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Verify", style=discord.ButtonStyle.success,
+                       emoji="\N{WHITE HEAVY CHECK MARK}", custom_id="sharky_verify")
+    async def verify(self, interaction: discord.Interaction, button: discord.ui.Button):
+        rid = _as_int(get_setting("verified_role_id"))
+        role = interaction.guild.get_role(rid) if rid else None
+        if role is None:
+            await interaction.response.send_message(
+                "Verification isn't set up yet. Ask an admin to run `/setup verify`.", ephemeral=True)
+            return
+        if role in interaction.user.roles:
+            await interaction.response.send_message("You're already verified. \N{WHITE HEAVY CHECK MARK}",
+                                                    ephemeral=True)
+            return
+        try:
+            await interaction.user.add_roles(role, reason="Verified via button")
+            await interaction.response.send_message(
+                f"You're verified — welcome in! {role.mention}", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "I couldn't add the role. My role needs to be **above** the verified role and have "
+                "**Manage Roles**.", ephemeral=True)
+
+
 class TicketControls(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -1533,6 +1714,7 @@ async def create_ticket(interaction: discord.Interaction, invoice_id: str, issue
 async def on_member_join(member: discord.Member):
     await log_event("member_join", user=member,
                     detail=f"Account created {discord.utils.format_dt(member.created_at, 'R')}")
+    await send_welcome(member)
 
 
 @bot.event
@@ -1722,6 +1904,15 @@ async def handle_download(request):
                             headers={"Content-Disposition": f'attachment; filename="{file_path.name}"'})
 
 
+LANDING_PAGE = Path(__file__).resolve().parent / "web" / "index.html"
+
+
+async def handle_home(_request):
+    if LANDING_PAGE.exists():
+        return web.FileResponse(LANDING_PAGE, headers={"Cache-Control": "public, max-age=300"})
+    return web.Response(text=f"{BRAND_NAME} is online.", content_type="text/plain")
+
+
 async def handle_health(_r):
     return web.json_response({"status": "ok"})
 
@@ -1734,6 +1925,8 @@ async def start_http():
     app.router.add_post("/verify", handle_verify)
     app.router.add_get("/verify", handle_verify)
     app.router.add_get("/dl/{product}", handle_download)
+    app.router.add_get("/", handle_home)
+    app.router.add_get("/home", handle_home)
     app.router.add_get("/health", handle_health)
     runner = web.AppRunner(app); await runner.setup()
     await web.TCPSite(runner, HTTP_HOST, HTTP_PORT).start()
@@ -1753,9 +1946,10 @@ async def on_ready():
         return
     _ready_once = True
 
-    # Register persistent ticket views so their buttons work across restarts.
+    # Register persistent views so their buttons work across restarts.
     bot.add_view(TicketLauncher())
     bot.add_view(TicketControls())
+    bot.add_view(VerifyView())
 
     try:
         if GUILD_ID:
