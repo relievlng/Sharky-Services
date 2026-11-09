@@ -481,8 +481,15 @@ def resolve_ticket_category(guild):
     return cat if isinstance(cat, discord.CategoryChannel) else None
 
 
+def resolve_staff_role(guild):
+    """The configured staff role (/setup staffrole), else a role named ADMIN_ROLE."""
+    rid = _as_int(get_setting("staff_role_id"))
+    role = guild.get_role(rid) if rid else None
+    return role or discord.utils.get(guild.roles, name=ADMIN_ROLE)
+
+
 def is_staff(interaction: discord.Interaction) -> bool:
-    """Allow the server owner, anyone with Administrator/Manage Server, or the ADMIN_ROLE."""
+    """Server owner, anyone with Administrator/Manage Server, ADMIN_ROLE, or the configured staff role."""
     member = interaction.user
     guild = interaction.guild
     if guild is not None and member.id == guild.owner_id:
@@ -490,7 +497,11 @@ def is_staff(interaction: discord.Interaction) -> bool:
     perms = getattr(member, "guild_permissions", None)
     if perms is not None and (perms.administrator or perms.manage_guild):
         return True
-    return ADMIN_ROLE in [r.name for r in getattr(member, "roles", [])]
+    member_roles = getattr(member, "roles", [])
+    if ADMIN_ROLE in [r.name for r in member_roles]:
+        return True
+    rid = _as_int(get_setting("staff_role_id"))
+    return bool(rid) and any(r.id == rid for r in member_roles)
 
 
 def brand_embed(title: str, description: str = None, color: int = None) -> discord.Embed:
@@ -724,7 +735,7 @@ async def deliver(user: discord.abc.User, product: str,
         member: discord.PermissionOverwrite(view_channel=True, read_message_history=True),
         guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
     }
-    staff_role = discord.utils.get(guild.roles, name=ADMIN_ROLE)
+    staff_role = resolve_staff_role(guild)
     if staff_role:
         overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
     category = resolve_ticket_category(guild)
@@ -850,7 +861,9 @@ async def setup_status(interaction: discord.Interaction):
         return f"**{label}:** {'<#' + str(cid) + '>' if cid else 'not set'}"
 
     cat_id = _as_int(get_setting("ticket_category"))
+    staff_rid = _as_int(get_setting("staff_role_id"))
     lines = [
+        f"**Staff role:** {'<@&' + str(staff_rid) + '>' if staff_rid else 'role named ' + ADMIN_ROLE}",
         feed("log_server", "Server logs"),
         feed("log_key", "Key logs"),
         feed("log_shop", "Shop logs"),
@@ -882,7 +895,7 @@ async def setup_all(interaction: discord.Interaction):
         return
     await interaction.response.defer(ephemeral=True)
 
-    staff_role = discord.utils.get(guild.roles, name=ADMIN_ROLE)
+    staff_role = resolve_staff_role(guild)
     staff_view = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
         guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
@@ -927,6 +940,19 @@ async def setup_all(interaction: discord.Interaction):
         f"Server, key, and shop logs now route to their own channels. "
         f"Next: add products with `/product add`.", ephemeral=True)
     await log_event("log_setup", user=interaction.user, detail="ran /setup all")
+
+
+@setup_group.command(name="staffrole",
+                     description="Set the staff role that sees tickets and gets pinged on new ones.")
+@app_commands.describe(role="The role to treat as staff")
+async def setup_staffrole(interaction: discord.Interaction, role: discord.Role):
+    if not is_staff(interaction):
+        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        return
+    set_setting("staff_role_id", str(role.id))
+    await interaction.response.send_message(
+        f"Staff role set to {role.mention}. They'll be added to new tickets and pinged when one opens.",
+        ephemeral=True)
 
 
 @setup_group.command(name="tickets", description="Post the support ticket panel in this channel.")
@@ -1181,6 +1207,7 @@ async def help_cmd(interaction: discord.Interaction):
             name="Setup (staff)",
             value="`/setup all` — create all log channels, a tickets area, and the panel\n"
                   "`/setup logs` — use the current channel for logs\n"
+                  "`/setup staffrole` — set the staff role that's pinged on tickets\n"
                   "`/setup tickets` — post a ticket panel here\n"
                   "`/setup status` — what's configured", inline=False)
         e.add_field(
@@ -1393,15 +1420,17 @@ async def create_ticket(interaction: discord.Interaction, invoice_id: str, issue
         opener: discord.PermissionOverwrite(view_channel=True, send_messages=True, attach_files=True),
         guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
     }
-    staff_role = discord.utils.get(guild.roles, name=ADMIN_ROLE)
+    staff_role = resolve_staff_role(guild)
     if staff_role:
         overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
 
     category = resolve_ticket_category(guild)
 
+    uname = "".join(c for c in opener.name.lower() if c.isalnum() or c == "-")[:24] or "user"
+
     try:
         channel = await guild.create_text_channel(
-            name=f"ticket-{number:04d}",
+            name=f"ticket-{number:04d}-{uname}",
             overwrites=overwrites,
             category=category,
             topic=f"Ticket #{number} • {opener} • {topic}",
