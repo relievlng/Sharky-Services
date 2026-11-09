@@ -16,8 +16,9 @@ RUN mkdir -p /app/data
 # bind-mount on a VPS) at /app/data. Railway rejects the Docker VOLUME keyword
 # at build validation, so the mount is configured in the host, not here.
 ENV DB_PATH=/app/data/licenses.db
-ENV LOG_FILE=/app/data/xzx-delivery.log
-ENV PRODUCTS_DIR=/app/products
+ENV LOG_FILE=/app/data/sharky-delivery.log
+# Product files live on the volume so they persist across redeploys.
+ENV PRODUCTS_DIR=/app/data/products
 
 # Railway/most hosts set PORT; the app already reads it
 EXPOSE 8080

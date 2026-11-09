@@ -13,6 +13,7 @@ Everything logs to a rotating file and a Discord log channel.
 """
 
 import os
+import io
 import asyncio
 import sqlite3
 import secrets
@@ -78,31 +79,55 @@ BRAND_NAME = os.environ.get("BRAND_NAME", "Sharky Services")
 BRAND_COLOR = int(os.environ.get("BRAND_COLOR", "0x2b2d31"), 16)
 TICKET_CATEGORY_ID = int(os.environ.get("TICKET_CATEGORY_ID", "0"))  # optional category for tickets
 
-# product name -> filename inside PRODUCTS_DIR
-PRODUCTS = {
-    "metal_detector": "XZX_MetalDetector.ahk",
-    "alt_click":      "XZX_AltClick.ahk",
-    "fishing":        "XZX_Fishing.ahk",
-}
+# License verification API (your macros POST their key here to check validity)
+VERIFY_API_KEY = os.environ.get("VERIFY_API_KEY", "")  # if set, callers must send it as X-Api-Key
+HWID_LOCK = os.environ.get("HWID_LOCK", "1") != "0"    # bind each key to the first machine that uses it
 
-# Stripe price id -> internal product (fallback; prefer product in metadata)
-PRICE_TO_PRODUCT = {
-    "price_metaldetector": "metal_detector",
-    "price_altclick":      "alt_click",
-    "price_fishing":       "fishing",
-}
+# Products are stored in the database and managed with /product add|remove|list.
+# Files live in PRODUCTS_DIR. Nothing is hardcoded — the owner adds their own.
 
 LOG_COLORS = {
     "key_generated":  0x5865F2,
     "linked":         0x5865F2,
     "log_setup":      0x57F287,
     "ticket_open":    0x5865F2,
+    "ticket_claim":   0x5865F2,
     "ticket_close":   0xFEE75C,
     "delivered":      0x57F287,
     "delivered_link": 0x57F287,
+    "delivered_chan": 0x57F287,
     "closed_dms":     0xFEE75C,
+    "key_revoked":    0xED4245,
+    "key_unrevoked":  0x57F287,
+    "hwid_reset":     0x5865F2,
+    "verify_ok":      0x57F287,
+    "verify_fail":    0xFEE75C,
     "failed":         0xED4245,
     "webhook_reject": 0xED4245,
+    # server logs
+    "member_join":    0x57F287,
+    "member_leave":   0xE67E22,
+    "member_ban":     0xED4245,
+    "member_unban":   0x57F287,
+    "msg_delete":     0xED4245,
+    "msg_edit":       0xFEE75C,
+    "role_change":    0x5865F2,
+    "channel_change": 0x5865F2,
+    "nick_change":    0x5865F2,
+}
+
+# Which saved log channel each event goes to. Missing -> general feed.
+LOG_ROUTES = {
+    # shop / purchase feed
+    "key_generated": "log_shop", "delivered": "log_shop", "delivered_link": "log_shop",
+    "delivered_chan": "log_shop", "closed_dms": "log_shop", "webhook_reject": "log_shop",
+    # license-key feed
+    "verify_ok": "log_key", "verify_fail": "log_key", "key_revoked": "log_key",
+    "key_unrevoked": "log_key", "hwid_reset": "log_key",
+    # server feed
+    "member_join": "log_server", "member_leave": "log_server", "member_ban": "log_server",
+    "member_unban": "log_server", "msg_delete": "log_server", "msg_edit": "log_server",
+    "role_change": "log_server", "channel_change": "log_server", "nick_change": "log_server",
 }
 
 # ===================== Logging =====================
@@ -148,6 +173,37 @@ def db_init():
             created_at  TEXT NOT NULL
         )
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS purchases (
+            invoice_id  TEXT PRIMARY KEY,
+            discord_id  INTEGER,
+            product     TEXT,
+            key         TEXT,
+            source      TEXT,
+            stripe_ref  TEXT,
+            created_at  TEXT NOT NULL
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS products (
+            name         TEXT PRIMARY KEY,
+            display_name TEXT,
+            filename     TEXT,
+            price_id     TEXT,
+            created_at   TEXT NOT NULL
+        )
+    """)
+    # Migration-safe column adds for existing databases.
+    existing = {r[1] for r in con.execute("PRAGMA table_info(licenses)").fetchall()}
+    if "hwid" not in existing:
+        con.execute("ALTER TABLE licenses ADD COLUMN hwid TEXT")
+    if "revoked" not in existing:
+        con.execute("ALTER TABLE licenses ADD COLUMN revoked INTEGER DEFAULT 0")
+    if "last_used_at" not in existing:
+        con.execute("ALTER TABLE licenses ADD COLUMN last_used_at TEXT")
+    tcols = {r[1] for r in con.execute("PRAGMA table_info(tickets)").fetchall()}
+    if "claimed_by" not in tcols:
+        con.execute("ALTER TABLE tickets ADD COLUMN claimed_by INTEGER")
     con.commit(); con.close()
 
 
@@ -173,6 +229,180 @@ def bind_key(key: str, discord_id: int):
     con = sqlite3.connect(DB_PATH)
     con.execute("UPDATE licenses SET discord_id = ? WHERE key = ?", (discord_id, key))
     con.commit(); con.close()
+
+
+def get_key(key: str):
+    """Return the license row as a dict, or None."""
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    row = con.execute("SELECT * FROM licenses WHERE key = ?", (key,)).fetchone()
+    con.close()
+    return dict(row) if row else None
+
+
+def keys_for_user(discord_id: int):
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    rows = con.execute(
+        "SELECT * FROM licenses WHERE discord_id = ? ORDER BY created_at DESC", (discord_id,)
+    ).fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+
+def set_key_revoked(key: str, revoked: bool) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.execute("UPDATE licenses SET revoked = ? WHERE key = ?", (1 if revoked else 0, key))
+    con.commit(); changed = cur.rowcount; con.close()
+    return changed > 0
+
+
+def reset_key_hwid(key: str) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.execute("UPDATE licenses SET hwid = NULL WHERE key = ?", (key,))
+    con.commit(); changed = cur.rowcount; con.close()
+    return changed > 0
+
+
+def verify_key(key: str, hwid: str = None):
+    """
+    Validate a key for the macros. Returns (ok: bool, product|None, reason).
+    Binds the HWID on first use when HWID_LOCK is on; rejects a mismatch after that.
+    """
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    row = con.execute("SELECT * FROM licenses WHERE key = ?", (key,)).fetchone()
+    if row is None:
+        con.close()
+        return False, None, "invalid_key"
+    row = dict(row)
+    if row.get("revoked"):
+        con.close()
+        return False, row["product"], "revoked"
+
+    if HWID_LOCK and hwid:
+        bound = row.get("hwid")
+        if not bound:
+            con.execute("UPDATE licenses SET hwid = ? WHERE key = ?", (hwid, key))
+        elif bound != hwid:
+            con.close()
+            return False, row["product"], "hwid_mismatch"
+
+    con.execute("UPDATE licenses SET last_used_at = ? WHERE key = ?",
+                (datetime.now(timezone.utc).isoformat(), key))
+    con.commit(); con.close()
+    return True, row["product"], "ok"
+
+
+# ----- Purchases / invoices (ties an invoice to the Discord buyer) -----
+def generate_invoice_id() -> str:
+    """A short, human-typable invoice id unique in the purchases table."""
+    con = sqlite3.connect(DB_PATH)
+    try:
+        for _ in range(12):
+            body = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(8))
+            inv = f"INV-{body[:4]}-{body[4:]}"
+            exists = con.execute("SELECT 1 FROM purchases WHERE invoice_id = ?", (inv,)).fetchone()
+            if not exists:
+                return inv
+        raise RuntimeError("Could not generate a unique invoice id")
+    finally:
+        con.close()
+
+
+def record_purchase(invoice_id: str, discord_id: int, product: str, key: str,
+                    source: str, stripe_ref: str = None):
+    con = sqlite3.connect(DB_PATH)
+    con.execute(
+        "INSERT OR REPLACE INTO purchases "
+        "(invoice_id, discord_id, product, key, source, stripe_ref, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (invoice_id, discord_id, product, key, source, stripe_ref,
+         datetime.now(timezone.utc).isoformat()),
+    )
+    con.commit(); con.close()
+
+
+def get_purchase(invoice_id: str):
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    row = con.execute("SELECT * FROM purchases WHERE invoice_id = ?",
+                      (invoice_id.strip(),)).fetchone()
+    con.close()
+    return dict(row) if row else None
+
+
+def verify_invoice(invoice_id: str, discord_id: int):
+    """
+    Check an invoice entered at ticket time.
+    Returns (status, purchase|None) where status is one of:
+      'ok'        - exists and belongs to this Discord user
+      'not_found' - no such invoice
+      'mismatch'  - exists but was bought by a different Discord user
+    """
+    p = get_purchase(invoice_id)
+    if p is None:
+        return "not_found", None
+    if p.get("discord_id") and int(p["discord_id"]) != int(discord_id):
+        return "mismatch", p
+    return "ok", p
+
+
+# ----- Products (owner-managed; nothing hardcoded) -----
+def add_product(name: str, display_name: str, filename: str, price_id: str = None):
+    con = sqlite3.connect(DB_PATH)
+    con.execute(
+        "INSERT OR REPLACE INTO products (name, display_name, filename, price_id, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (name, display_name, filename, price_id, datetime.now(timezone.utc).isoformat()),
+    )
+    con.commit(); con.close()
+
+
+def remove_product(name: str) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.execute("DELETE FROM products WHERE name = ?", (name,))
+    con.commit(); changed = cur.rowcount; con.close()
+    return changed > 0
+
+
+def get_product(name: str):
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    row = con.execute("SELECT * FROM products WHERE name = ?", (name,)).fetchone()
+    con.close()
+    return dict(row) if row else None
+
+
+def list_products():
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    rows = con.execute("SELECT * FROM products ORDER BY name").fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+
+def product_by_price_id(price_id: str):
+    if not price_id:
+        return None
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute("SELECT name FROM products WHERE price_id = ?", (price_id,)).fetchone()
+    con.close()
+    return row[0] if row else None
+
+
+def product_file_path(name: str):
+    p = get_product(name)
+    if not p or not p.get("filename"):
+        return None
+    return PRODUCTS_DIR / p["filename"]
+
+
+def slugify_product(name: str) -> str:
+    out = "".join(c.lower() if c.isalnum() else "_" for c in name).strip("_")
+    while "__" in out:
+        out = out.replace("__", "_")
+    return out or "product"
 
 
 def save_link(discord_id: int, username: str):
@@ -202,15 +432,34 @@ def set_setting(key: str, value: str):
     con.commit(); con.close()
 
 
-def resolve_log_channel_id():
-    """Log channel set by /setup logs takes priority; else the LOG_CHANNEL_ID env var."""
-    stored = get_setting("log_channel_id")
-    if stored:
-        try:
-            return int(stored)
-        except ValueError:
-            return None
+def _as_int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def resolve_log_channel_id(event: str = None):
+    """
+    Pick the log channel for an event: the specific feed (server/key/shop) if set,
+    else the general feed (/setup logs), else the LOG_CHANNEL_ID env var.
+    """
+    route_key = LOG_ROUTES.get(event) if event else None
+    if route_key:
+        cid = _as_int(get_setting(route_key))
+        if cid:
+            return cid
+    cid = _as_int(get_setting("log_channel_id"))
+    if cid:
+        return cid
     return LOG_CHANNEL_ID or None
+
+
+def resolve_ticket_category(guild):
+    """Ticket category from /setup, else the TICKET_CATEGORY_ID env var."""
+    cid = _as_int(get_setting("ticket_category")) or (TICKET_CATEGORY_ID or None)
+    cat = guild.get_channel(cid) if cid else None
+    return cat if isinstance(cat, discord.CategoryChannel) else None
 
 
 def is_staff(interaction: discord.Interaction) -> bool:
@@ -255,6 +504,30 @@ def close_ticket_record(channel_id: int):
     con = sqlite3.connect(DB_PATH)
     con.execute("UPDATE tickets SET status = 'closed' WHERE channel_id = ?", (channel_id,))
     con.commit(); con.close()
+
+
+def open_ticket_for(opener_id: int):
+    """Return (number, channel_id) of this user's open ticket, or None."""
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute(
+        "SELECT number, channel_id FROM tickets WHERE opener_id = ? AND status = 'open' "
+        "ORDER BY number DESC LIMIT 1", (opener_id,)
+    ).fetchone()
+    con.close()
+    return row
+
+
+def set_ticket_claimed(channel_id: int, staff_id: int):
+    con = sqlite3.connect(DB_PATH)
+    con.execute("UPDATE tickets SET claimed_by = ? WHERE channel_id = ?", (staff_id, channel_id))
+    con.commit(); con.close()
+
+
+def ticket_opener(channel_id: int):
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute("SELECT opener_id FROM tickets WHERE channel_id = ?", (channel_id,)).fetchone()
+    con.close()
+    return row[0] if row else None
 
 
 # ===================== Signed tokens (links / state / claims) =====================
@@ -311,7 +584,16 @@ def verify_claim(token: str):
 
 
 # ===================== Bot =====================
+# Server logs (joins/leaves, message edits/deletes) need privileged intents.
+# These are OFF by default so the bot can never crash on boot. To turn them on:
+#   1) set SERVER_LOGS=1 in Railway
+#   2) enable "Server Members Intent" and "Message Content Intent" in the
+#      Discord Developer Portal -> your app -> Bot.
+SERVER_LOGS = os.environ.get("SERVER_LOGS", "0") != "0"
 intents = discord.Intents.default()
+if SERVER_LOGS:
+    intents.members = True
+    intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
@@ -323,7 +605,7 @@ async def log_event(event: str, *, user=None, product=None, key=None, detail=Non
     if detail:  parts.append(f"detail={detail}")
     (log.error if event in ("failed", "webhook_reject") else log.info)(" ".join(parts))
 
-    channel_id = resolve_log_channel_id()
+    channel_id = resolve_log_channel_id(event)
     if not channel_id:
         return
     channel = bot.get_channel(channel_id)
@@ -345,74 +627,135 @@ async def log_event(event: str, *, user=None, product=None, key=None, detail=Non
         log.error("Could not post to log channel: %s", e)
 
 
-async def deliver(user: discord.abc.User, product: str) -> tuple[bool, str]:
-    if product not in PRODUCTS:
+async def deliver(user: discord.abc.User, product: str,
+                  source: str = "manual", stripe_ref: str = None) -> tuple[bool, str]:
+    prod = get_product(product)
+    if prod is None:
         await log_event("failed", user=user, product=product, detail="unknown product")
         return False, f"Unknown product: {product}"
     if not is_linked(user.id):
         await log_event("failed", user=user, product=product, detail="not linked via oauth")
         return False, "buyer has not linked their Discord account"
 
-    file_path = PRODUCTS_DIR / PRODUCTS[product]
+    file_path = PRODUCTS_DIR / prod["filename"]
     if not file_path.exists():
         await log_event("failed", user=user, product=product, detail="file missing on disk")
         return False, f"Product file not found for {product}"
 
     key = generate_key(product)
     bind_key(key, user.id)
-    await log_event("key_generated", user=user, product=product, key=key)
+    invoice_id = generate_invoice_id()
+    record_purchase(invoice_id, user.id, product, key, source, stripe_ref)
+    await log_event("key_generated", user=user, product=product, key=key,
+                    detail=f"invoice {invoice_id}")
 
     size = file_path.stat().st_size
     use_link = size > ATTACH_LIMIT_BYTES
+    if use_link and not PUBLIC_BASE_URL:
+        await log_event("failed", user=user, product=product, key=key,
+                        detail=f"file {size}B over limit, PUBLIC_BASE_URL unset")
+        return False, "file too large and no download host configured"
 
-    embed = brand_embed("Purchase Delivered",
-                        f"Thanks for buying **{product.replace('_', ' ').title()}**.")
-    embed.add_field(name="Your License Key", value=f"```{key}```", inline=False)
+    title = prod.get("display_name") or product.replace("_", " ").title()
+
+    def build_embed() -> discord.Embed:
+        e = brand_embed("Purchase Delivered",
+                        f"Thanks for buying **{title}**. Keep your key private — one key, one user.")
+        e.add_field(name="Invoice ID", value=f"`{invoice_id}`", inline=True)
+        e.add_field(name="Product", value=title, inline=True)
+        e.add_field(name="License Key", value=f"```{key}```", inline=False)
+        if use_link:
+            e.add_field(name="Download",
+                        value=f"[Download {file_path.name}]({make_download_url(product)})\n"
+                              f"Link expires in {LINK_TTL // 60} min.", inline=False)
+        else:
+            e.add_field(name="File", value=file_path.name, inline=False)
+        return e
+
+    async def send_to(dest, content=None):
+        if use_link:
+            await dest.send(content=content, embed=build_embed())
+        else:
+            await dest.send(content=content, embed=build_embed(), file=discord.File(file_path))
+
+    # 1) Try the DM.
+    try:
+        await send_to(user)
+        await log_event("delivered" if not use_link else "delivered_link",
+                        user=user, product=product, key=key, detail=f"invoice {invoice_id}")
+        return True, key
+    except discord.Forbidden:
+        pass  # DMs closed — fall through to channel delivery
+    except discord.HTTPException as e:
+        await log_event("failed", user=user, product=product, key=key, detail=str(e))
+        return False, f"send_failed: {e}"
+
+    # 2) DMs are closed: deliver into a private channel so the paid buyer still gets it.
+    guild = bot.get_guild(GUILD_ID) if GUILD_ID else None
+    member = guild.get_member(user.id) if guild else None
+    if guild is None or member is None:
+        await log_event("closed_dms", user=user, product=product, key=key,
+                        detail="DMs closed and buyer not reachable in the server")
+        return False, "closed_dms"
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        member: discord.PermissionOverwrite(view_channel=True, read_message_history=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
+    }
+    staff_role = discord.utils.get(guild.roles, name=ADMIN_ROLE)
+    if staff_role:
+        overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+    category = resolve_ticket_category(guild)
 
     try:
-        if use_link:
-            if not PUBLIC_BASE_URL:
-                await log_event("failed", user=user, product=product, key=key,
-                                detail=f"file {size}B over limit, PUBLIC_BASE_URL unset")
-                return False, "file too large and no download host configured"
-            url = make_download_url(product)
-            embed.add_field(name="Download",
-                            value=f"[Download {file_path.name}]({url})\nLink expires in {LINK_TTL // 60} min.",
-                            inline=False)
-            embed.set_footer(text="Keep your key private. One key = one user.")
-            await user.send(embed=embed)
-            await log_event("delivered_link", user=user, product=product, key=key)
-        else:
-            embed.add_field(name="Product", value=file_path.name, inline=False)
-            embed.set_footer(text="Keep your key private. One key = one user.")
-            await user.send(embed=embed, file=discord.File(file_path))
-            await log_event("delivered", user=user, product=product, key=key)
+        channel = await guild.create_text_channel(
+            name=f"delivery-{invoice_id.split('-')[-1].lower()}",
+            overwrites=overwrites, category=category,
+            topic=f"Delivery for {member} • Invoice {invoice_id}",
+            reason="Buyer has DMs closed; delivering in a private channel",
+        )
+        await send_to(channel, content=f"{member.mention} your DMs are closed, so here's your order:")
+        await log_event("delivered_chan", user=user, product=product, key=key,
+                        detail=f"invoice {invoice_id} in #{channel.name}")
         return True, key
     except discord.Forbidden:
         await log_event("closed_dms", user=user, product=product, key=key,
-                        detail="DMs closed — key generated but not delivered")
+                        detail="DMs closed and no Manage Channels permission for fallback")
         return False, "closed_dms"
     except discord.HTTPException as e:
         await log_event("failed", user=user, product=product, key=key, detail=str(e))
         return False, f"send_failed: {e}"
 
 
+async def product_autocomplete(interaction: discord.Interaction, current: str):
+    current = (current or "").lower()
+    return [
+        app_commands.Choice(name=p["display_name"] or p["name"], value=p["name"])
+        for p in list_products()
+        if current in p["name"].lower() or current in (p["display_name"] or "").lower()
+    ][:25]
+
+
 # ---- Slash command: manual delivery ----
-@bot.tree.command(description="Deliver a product + key to a buyer (staff only).")
+@bot.tree.command(name="deliver", description="Deliver a product + key to a buyer (staff only).")
 @app_commands.describe(member="Who bought it", product="Which product")
-@app_commands.choices(product=[app_commands.Choice(name=p, value=p) for p in PRODUCTS])
-async def deliver_cmd(interaction: discord.Interaction, member: discord.Member,
-                      product: app_commands.Choice[str]):
+@app_commands.autocomplete(product=product_autocomplete)
+async def deliver_cmd(interaction: discord.Interaction, member: discord.Member, product: str):
     if not is_staff(interaction):
         await interaction.response.send_message("You can't use this.", ephemeral=True); return
+    if get_product(product) is None:
+        await interaction.response.send_message(
+            f"No product named `{product}`. Add it with `/product add`.", ephemeral=True)
+        return
     await interaction.response.defer(ephemeral=True)
-    ok, result = await deliver(member, product.value)
+    ok, result = await deliver(member, product, source="manual")
     if ok:
         await interaction.followup.send(
-            f"Delivered **{product.value}** to {member.mention}. Key: `{result}`", ephemeral=True)
+            f"Delivered **{product}** to {member.mention}. Key: `{result}`", ephemeral=True)
     elif result == "closed_dms":
         await interaction.followup.send(
-            f"{member.mention} has DMs closed. Key saved — they open DMs, then re-run.", ephemeral=True)
+            f"{member.mention} has DMs closed and couldn't be reached. Key + invoice saved.", ephemeral=True)
     else:
         await interaction.followup.send(f"Failed: {result}", ephemeral=True)
 
@@ -480,17 +823,93 @@ async def setup_status(interaction: discord.Interaction):
     if not is_staff(interaction):
         await interaction.response.send_message("You can't use this.", ephemeral=True)
         return
-    log_id = resolve_log_channel_id()
+
+    def feed(key, label):
+        cid = _as_int(get_setting(key))
+        return f"**{label}:** {'<#' + str(cid) + '>' if cid else 'not set'}"
+
+    cat_id = _as_int(get_setting("ticket_category"))
     lines = [
-        f"**Logs:** {'<#' + str(log_id) + '>' if log_id else 'not set — run `/setup logs`'}",
+        feed("log_server", "Server logs"),
+        feed("log_key", "Key logs"),
+        feed("log_shop", "Shop logs"),
+        feed("log_channel_id", "General logs"),
+        f"**Ticket category:** {'set' if cat_id else 'not set'}",
+        f"**Products:** {len(list_products())} added",
         f"**OAuth login:** {'configured' if OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET else 'not set'}",
         f"**Public URL:** {PUBLIC_BASE_URL or 'not set'}",
-        f"**Stripe payments:** {'configured' if STRIPE_WEBHOOK_SECRET else 'not set (set up later)'}",
+        f"**Stripe payments:** {'configured' if STRIPE_WEBHOOK_SECRET else 'not set (optional)'}",
+        f"**Server logs intent:** {'on' if SERVER_LOGS else 'off (set SERVER_LOGS=1)'}",
     ]
-    embed = discord.Embed(title="Setup Status", color=0x5865F2,
-                          description="\n".join(lines),
-                          timestamp=datetime.now(timezone.utc))
+    embed = brand_embed("Setup Status", "\n".join(lines))
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@setup_group.command(name="all",
+                     description="One-click: create every log channel, a tickets area, and the panel.")
+async def setup_all(interaction: discord.Interaction):
+    if not is_staff(interaction):
+        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        return
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message("Run this in a server.", ephemeral=True)
+        return
+    if not guild.me.guild_permissions.manage_channels:
+        await interaction.response.send_message(
+            "I need the **Manage Channels** permission first, then run this again.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    staff_role = discord.utils.get(guild.roles, name=ADMIN_ROLE)
+    staff_view = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+    }
+    if staff_role:
+        staff_view[staff_role] = discord.PermissionOverwrite(view_channel=True)
+
+    created = []
+    try:
+        logs_cat = await guild.create_category("\N{CLIPBOARD} Sharky Logs", overwrites=staff_view)
+        feeds = {
+            "log_server": await guild.create_text_channel("server-logs", category=logs_cat, overwrites=staff_view),
+            "log_key":    await guild.create_text_channel("key-logs", category=logs_cat, overwrites=staff_view),
+            "log_shop":   await guild.create_text_channel("shop-logs", category=logs_cat, overwrites=staff_view),
+            "log_channel_id": await guild.create_text_channel("bot-logs", category=logs_cat, overwrites=staff_view),
+        }
+        for setting_key, ch in feeds.items():
+            set_setting(setting_key, str(ch.id))
+            created.append(ch)
+
+        tickets_cat = await guild.create_category("\N{ADMISSION TICKETS} Tickets")
+        set_setting("ticket_category", str(tickets_cat.id))
+        support_view = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+        }
+        support_ch = await guild.create_text_channel("support", category=tickets_cat, overwrites=support_view)
+        await support_ch.send(
+            embed=brand_embed("Support",
+                              "Need help with a purchase? Open a ticket below and enter your "
+                              "**Invoice ID**. A staff member will be with you shortly."),
+            view=TicketLauncher())
+        created.append(support_ch)
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I ran out of permissions partway through. Make sure I have **Manage Channels** "
+            "and try again.", ephemeral=True)
+        return
+    except discord.HTTPException as e:
+        await interaction.followup.send(f"Something went wrong creating channels: {e}", ephemeral=True)
+        return
+
+    body = "\n".join(f"• {c.mention}" for c in created)
+    await interaction.followup.send(
+        f"**Setup complete!** Everything's wired automatically:\n{body}\n\n"
+        f"Server, key, and shop logs now route to their own channels. "
+        f"Next: add products with `/product add`.", ephemeral=True)
+    await log_event("log_setup", user=interaction.user, detail="ran /setup all")
 
 
 @setup_group.command(name="tickets", description="Post the support ticket panel in this channel.")
@@ -510,11 +929,237 @@ async def setup_tickets(interaction: discord.Interaction):
 bot.tree.add_command(setup_group)
 
 
+# ===================== Product management =====================
+product_group = app_commands.Group(name="product", description="Manage products (staff only).")
+
+
+@product_group.command(name="add", description="Add a product and upload its file.")
+@app_commands.describe(name="Short internal name", file="The file buyers receive",
+                       display_name="Nice name shown to buyers (optional)",
+                       price_id="Stripe price id, e.g. price_123 (optional)")
+async def product_add(interaction: discord.Interaction, name: str, file: discord.Attachment,
+                      display_name: str = None, price_id: str = None):
+    if not is_staff(interaction):
+        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    slug = slugify_product(name)
+    PRODUCTS_DIR.mkdir(parents=True, exist_ok=True)
+    safe_name = f"{slug}_{file.filename}".replace("/", "_").replace("\\", "_")
+    try:
+        await file.save(PRODUCTS_DIR / safe_name)
+    except Exception as e:
+        await interaction.followup.send(f"Couldn't save the file: {e}", ephemeral=True)
+        return
+    add_product(slug, display_name or name, safe_name, price_id)
+    await interaction.followup.send(
+        f"Added **{display_name or name}** as `{slug}` ({file.filename}, "
+        f"{file.size // 1024} KB).\nUse this name in `/deliver` and as `product` in Stripe metadata.",
+        ephemeral=True)
+
+
+@product_group.command(name="remove", description="Remove a product.")
+@app_commands.autocomplete(name=product_autocomplete)
+async def product_remove(interaction: discord.Interaction, name: str):
+    if not is_staff(interaction):
+        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        return
+    prod = get_product(name)
+    if prod and prod.get("filename"):
+        try:
+            (PRODUCTS_DIR / prod["filename"]).unlink(missing_ok=True)
+        except OSError:
+            pass
+    ok = remove_product(name)
+    await interaction.response.send_message(
+        f"Removed `{name}`." if ok else f"No product named `{name}`.", ephemeral=True)
+
+
+@product_group.command(name="list", description="List all products.")
+async def product_list(interaction: discord.Interaction):
+    if not is_staff(interaction):
+        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        return
+    prods = list_products()
+    if not prods:
+        await interaction.response.send_message(
+            "No products yet. Add one with `/product add`.", ephemeral=True)
+        return
+    lines = []
+    for p in prods:
+        price = f" • `{p['price_id']}`" if p.get("price_id") else ""
+        lines.append(f"**{p['display_name'] or p['name']}** — `{p['name']}` ({p['filename']}){price}")
+    await interaction.response.send_message(
+        embed=brand_embed("Products", "\n".join(lines)), ephemeral=True)
+
+
+bot.tree.add_command(product_group)
+
+
+# ===================== Key management =====================
+async def send_existing_key(user: discord.abc.User, row: dict) -> tuple[bool, str]:
+    """Re-send an existing key + file to its owner (used by /key resend)."""
+    prod = get_product(row["product"])
+    if not prod:
+        return False, "product no longer exists"
+    key = row["key"]
+    fp = PRODUCTS_DIR / prod["filename"]
+    e = brand_embed("Your License",
+                    f"Here's your **{prod.get('display_name') or row['product']}** again. "
+                    f"Keep your key private — one key, one user.")
+    e.add_field(name="License Key", value=f"```{key}```", inline=False)
+    try:
+        if fp.exists() and fp.stat().st_size <= ATTACH_LIMIT_BYTES:
+            await user.send(embed=e, file=discord.File(fp))
+        elif fp.exists() and PUBLIC_BASE_URL:
+            e.add_field(name="Download",
+                        value=f"[Download {fp.name}]({make_download_url(row['product'])})", inline=False)
+            await user.send(embed=e)
+        else:
+            await user.send(embed=e)
+        return True, "ok"
+    except discord.Forbidden:
+        return False, "closed_dms"
+    except discord.HTTPException as ex:
+        return False, str(ex)
+
+
+key_group = app_commands.Group(name="key", description="Manage license keys (staff only).")
+
+
+@key_group.command(name="lookup", description="Look up a license key.")
+async def key_lookup(interaction: discord.Interaction, key: str):
+    if not is_staff(interaction):
+        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        return
+    row = get_key(key.strip())
+    if not row:
+        await interaction.response.send_message("No such key.", ephemeral=True)
+        return
+    owner = f"<@{row['discord_id']}>" if row.get("discord_id") else "unbound"
+    e = brand_embed("Key Lookup")
+    e.add_field(name="Key", value=f"`{row['key']}`", inline=False)
+    e.add_field(name="Product", value=row.get("product") or "—", inline=True)
+    e.add_field(name="Owner", value=owner, inline=True)
+    e.add_field(name="Revoked", value="yes" if row.get("revoked") else "no", inline=True)
+    e.add_field(name="HWID", value=f"`{row['hwid']}`" if row.get("hwid") else "not bound", inline=False)
+    e.add_field(name="Last used", value=(row.get("last_used_at") or "never")[:19], inline=True)
+    await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+@key_group.command(name="revoke", description="Revoke a key so it stops validating.")
+async def key_revoke(interaction: discord.Interaction, key: str):
+    if not is_staff(interaction):
+        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        return
+    ok = set_key_revoked(key.strip(), True)
+    if ok:
+        await log_event("key_revoked", user=interaction.user, key=key.strip())
+    await interaction.response.send_message(
+        f"Revoked `{key}`." if ok else "No such key.", ephemeral=True)
+
+
+@key_group.command(name="unrevoke", description="Re-enable a revoked key.")
+async def key_unrevoke(interaction: discord.Interaction, key: str):
+    if not is_staff(interaction):
+        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        return
+    ok = set_key_revoked(key.strip(), False)
+    if ok:
+        await log_event("key_unrevoked", user=interaction.user, key=key.strip())
+    await interaction.response.send_message(
+        f"Re-enabled `{key}`." if ok else "No such key.", ephemeral=True)
+
+
+@key_group.command(name="resethwid", description="Clear a key's machine lock so it can be used on a new PC.")
+async def key_resethwid(interaction: discord.Interaction, key: str):
+    if not is_staff(interaction):
+        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        return
+    ok = reset_key_hwid(key.strip())
+    if ok:
+        await log_event("hwid_reset", user=interaction.user, key=key.strip())
+    await interaction.response.send_message(
+        f"Reset the machine lock on `{key}`." if ok else "No such key.", ephemeral=True)
+
+
+@key_group.command(name="resend", description="Re-send a key and its file to the buyer's DMs.")
+async def key_resend(interaction: discord.Interaction, key: str):
+    if not is_staff(interaction):
+        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        return
+    row = get_key(key.strip())
+    if not row:
+        await interaction.response.send_message("No such key.", ephemeral=True)
+        return
+    if not row.get("discord_id"):
+        await interaction.response.send_message("That key isn't bound to a user.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        user = await bot.fetch_user(int(row["discord_id"]))
+    except discord.HTTPException:
+        await interaction.followup.send("Couldn't find that user.", ephemeral=True)
+        return
+    ok, reason = await send_existing_key(user, row)
+    await interaction.followup.send(
+        f"Re-sent to {user.mention}." if ok else f"Couldn't send: {reason}", ephemeral=True)
+
+
+bot.tree.add_command(key_group)
+
+
+@bot.tree.command(name="keys", description="List a member's license keys (staff only).")
+@app_commands.describe(member="Whose keys to list")
+async def keys_cmd(interaction: discord.Interaction, member: discord.Member):
+    if not is_staff(interaction):
+        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        return
+    rows = keys_for_user(member.id)
+    if not rows:
+        await interaction.response.send_message(f"{member.mention} has no keys.", ephemeral=True)
+        return
+    lines = []
+    for r in rows:
+        flags = " \N{CROSS MARK} revoked" if r.get("revoked") else ""
+        lines.append(f"`{r['key']}` — {r.get('product') or '—'}{flags}")
+    await interaction.response.send_message(
+        embed=brand_embed(f"Keys for {member.display_name}", "\n".join(lines[:25])), ephemeral=True)
+
+
+@bot.tree.command(name="help", description="Show what this bot can do.")
+async def help_cmd(interaction: discord.Interaction):
+    staff = is_staff(interaction)
+    e = brand_embed(f"{BRAND_NAME} — Help",
+                    "Buy from the website and the bot DMs you your product and license key. "
+                    "Open a ticket for support using your invoice ID.")
+    e.add_field(name="Everyone",
+                value="`/help` — this menu", inline=False)
+    if staff:
+        e.add_field(
+            name="Setup (staff)",
+            value="`/setup all` — create all log channels, a tickets area, and the panel\n"
+                  "`/setup logs` — use the current channel for logs\n"
+                  "`/setup tickets` — post a ticket panel here\n"
+                  "`/setup status` — what's configured", inline=False)
+        e.add_field(
+            name="Products & delivery (staff)",
+            value="`/product add` — add a product + file\n"
+                  "`/product list` · `/product remove`\n"
+                  "`/deliver` — manually deliver to a buyer\n"
+                  "`/stats` — sales stats", inline=False)
+        e.add_field(
+            name="Keys (staff)",
+            value="`/key lookup` · `/key revoke` · `/key unrevoke`\n"
+                  "`/key resethwid` · `/key resend` · `/keys @user`", inline=False)
+    await interaction.response.send_message(embed=e, ephemeral=True)
+
+
 # ===================== Ticket system =====================
 class TicketModal(discord.ui.Modal, title="Open a Support Ticket"):
     invoice_id = discord.ui.TextInput(
         label="Invoice ID",
-        placeholder="Your purchase / invoice ID",
+        placeholder="The invoice ID from your purchase (e.g. INV-XXXX-XXXX)",
         required=True, max_length=120,
     )
     issue = discord.ui.TextInput(
@@ -537,28 +1182,36 @@ class TicketLauncher(discord.ui.View):
         await interaction.response.send_modal(TicketModal())
 
 
-class TicketCloseView(discord.ui.View):
+class TicketControls(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.danger,
-                       emoji="\N{LOCK}", custom_id="sharky_close_ticket")
-    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        channel = interaction.channel
-        # Opener or staff may close.
-        con = sqlite3.connect(DB_PATH)
-        row = con.execute("SELECT opener_id FROM tickets WHERE channel_id = ?",
-                          (channel.id,)).fetchone()
-        con.close()
-        opener_id = row[0] if row else None
-        if not (is_staff(interaction) or interaction.user.id == opener_id):
-            await interaction.response.send_message("Only staff or the ticket opener can close this.",
-                                                    ephemeral=True)
+    @discord.ui.button(label="Claim", style=discord.ButtonStyle.success,
+                       emoji="\N{RAISED HAND}", custom_id="sharky_claim_ticket")
+    async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_staff(interaction):
+            await interaction.response.send_message("Only staff can claim tickets.", ephemeral=True)
             return
+        set_ticket_claimed(interaction.channel.id, interaction.user.id)
+        await log_event("ticket_claim", user=interaction.user,
+                        detail=f"#{getattr(interaction.channel, 'name', '')}")
+        await interaction.response.send_message(
+            f"\N{RAISED HAND} Ticket claimed by {interaction.user.mention}.")
+
+    @discord.ui.button(label="Close", style=discord.ButtonStyle.danger,
+                       emoji="\N{LOCK}", custom_id="sharky_close_ticket")
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        channel = interaction.channel
+        opener_id = ticket_opener(channel.id)
+        if not (is_staff(interaction) or interaction.user.id == opener_id):
+            await interaction.response.send_message(
+                "Only staff or the ticket opener can close this.", ephemeral=True)
+            return
+        await interaction.response.send_message("Saving transcript and closing in 5 seconds…")
+        await save_ticket_transcript(channel)
         close_ticket_record(channel.id)
         await log_event("ticket_close", user=interaction.user,
                         detail=f"closed #{getattr(channel, 'name', channel.id)}")
-        await interaction.response.send_message("Closing this ticket in 5 seconds…")
         await asyncio.sleep(5)
         try:
             await channel.delete(reason=f"Ticket closed by {interaction.user}")
@@ -566,11 +1219,61 @@ class TicketCloseView(discord.ui.View):
             log.error("Failed to delete ticket channel %s: %s", channel.id, e)
 
 
+async def save_ticket_transcript(channel):
+    """Build a plain-text transcript and post it to the log feed before deletion."""
+    try:
+        lines = []
+        async for m in channel.history(limit=1000, oldest_first=True):
+            ts = m.created_at.strftime("%Y-%m-%d %H:%M")
+            content = m.content or ("[embed]" if m.embeds else "")
+            if m.attachments:
+                content += " [" + ", ".join(a.filename for a in m.attachments) + "]"
+            lines.append(f"[{ts}] {m.author}: {content}")
+        text = "\n".join(lines) or "(no messages)"
+    except discord.HTTPException:
+        text = "(could not read channel history)"
+    log_id = resolve_log_channel_id("ticket_close")
+    ch = bot.get_channel(log_id) if log_id else None
+    if ch:
+        e = brand_embed("Ticket Transcript",
+                        f"Transcript for **{getattr(channel, 'name', channel.id)}**.")
+        try:
+            await ch.send(embed=e, file=discord.File(io.BytesIO(text.encode()),
+                                                     filename=f"{getattr(channel,'name','ticket')}.txt"))
+        except discord.HTTPException as ex:
+            log.error("Could not post transcript: %s", ex)
+
+
 async def create_ticket(interaction: discord.Interaction, invoice_id: str, issue: str):
     guild = interaction.guild
     opener = interaction.user
     if guild is None:
         await interaction.response.send_message("Tickets can only be opened in a server.", ephemeral=True)
+        return
+
+    # One open ticket per user.
+    existing = open_ticket_for(opener.id)
+    if existing:
+        ch = guild.get_channel(existing[1])
+        if ch:
+            await interaction.response.send_message(
+                f"You already have an open ticket: {ch.mention}", ephemeral=True)
+            return
+        close_ticket_record(existing[1])  # stale record; channel was deleted
+
+    # Verify the invoice is real and belongs to this buyer.
+    status, purchase = verify_invoice(invoice_id, opener.id)
+    if status == "not_found":
+        await interaction.response.send_message(
+            "That invoice ID wasn't found. Double-check your purchase confirmation and try again.",
+            ephemeral=True)
+        await log_event("verify_fail", user=opener, detail=f"ticket invoice not found: {invoice_id}")
+        return
+    if status == "mismatch":
+        await interaction.response.send_message(
+            "That invoice belongs to a different account — you can only open a ticket for your own purchase.",
+            ephemeral=True)
+        await log_event("verify_fail", user=opener, detail=f"ticket invoice mismatch: {invoice_id}")
         return
 
     number = next_ticket_number()
@@ -583,9 +1286,7 @@ async def create_ticket(interaction: discord.Interaction, invoice_id: str, issue
     if staff_role:
         overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
 
-    category = guild.get_channel(TICKET_CATEGORY_ID) if TICKET_CATEGORY_ID else None
-    if not isinstance(category, discord.CategoryChannel):
-        category = None
+    category = resolve_ticket_category(guild)
 
     try:
         channel = await guild.create_text_channel(
@@ -603,18 +1304,80 @@ async def create_ticket(interaction: discord.Interaction, invoice_id: str, issue
 
     record_ticket(number, channel.id, opener.id, invoice_id)
 
+    prod = get_product(purchase.get("product") or "")
+    product_label = (prod or {}).get("display_name") or purchase.get("product") or "—"
     embed = brand_embed(
         f"Ticket #{number:04d}",
         f"Thanks {opener.mention} — a staff member will be with you shortly.",
     )
-    embed.add_field(name="Invoice ID", value=f"`{invoice_id}`", inline=False)
+    embed.add_field(name="Invoice", value=f"`{invoice_id}` \N{WHITE HEAVY CHECK MARK} verified", inline=False)
+    embed.add_field(name="Product", value=product_label, inline=True)
+    embed.add_field(name="Purchased", value=(purchase.get("created_at") or "")[:10] or "—", inline=True)
     if issue.strip():
         embed.add_field(name="Issue", value=issue[:1024], inline=False)
 
-    await channel.send(content=opener.mention, embed=embed, view=TicketCloseView())
+    ping = opener.mention + (f" {staff_role.mention}" if staff_role else "")
+    await channel.send(content=ping, embed=embed, view=TicketControls())
     await interaction.response.send_message(f"Ticket created: {channel.mention}", ephemeral=True)
-    await log_event("ticket_open", user=opener,
-                    detail=f"#{channel.name} • invoice {invoice_id}")
+    await log_event("ticket_open", user=opener, detail=f"#{channel.name} • invoice {invoice_id}")
+
+
+# ===================== Server logs (joins, leaves, edits, deletes, bans) =====================
+@bot.event
+async def on_member_join(member: discord.Member):
+    await log_event("member_join", user=member,
+                    detail=f"Account created {discord.utils.format_dt(member.created_at, 'R')}")
+
+
+@bot.event
+async def on_member_remove(member: discord.Member):
+    roles = [r.name for r in getattr(member, "roles", []) if r.name != "@everyone"]
+    await log_event("member_leave", user=member,
+                    detail="Roles: " + (", ".join(roles) if roles else "none"))
+
+
+@bot.event
+async def on_member_ban(guild: discord.Guild, user: discord.abc.User):
+    await log_event("member_ban", user=user, detail=f"Banned from {guild.name}")
+
+
+@bot.event
+async def on_member_unban(guild: discord.Guild, user: discord.abc.User):
+    await log_event("member_unban", user=user, detail=f"Unbanned from {guild.name}")
+
+
+@bot.event
+async def on_message_delete(message: discord.Message):
+    if message.author.bot or message.guild is None:
+        return
+    content = (message.content or "").strip() or "*(no text / attachment only)*"
+    await log_event("msg_delete", user=message.author,
+                    detail=f"In {message.channel.mention}:\n{content[:1000]}")
+
+
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    if after.author.bot or after.guild is None or before.content == after.content:
+        return
+    await log_event("msg_edit", user=after.author,
+                    detail=f"In {after.channel.mention}\n**Before:** {(before.content or '')[:450]}\n"
+                           f"**After:** {(after.content or '')[:450]}")
+
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    if before.nick != after.nick:
+        await log_event("nick_change", user=after,
+                        detail=f"`{before.nick or before.name}` → `{after.nick or after.name}`")
+    else:
+        b, a = set(before.roles), set(after.roles)
+        added = [r.name for r in a - b]
+        removed = [r.name for r in b - a]
+        if added or removed:
+            parts = []
+            if added:   parts.append("➕ " + ", ".join(added))
+            if removed: parts.append("➖ " + ", ".join(removed))
+            await log_event("role_change", user=after, detail=" • ".join(parts))
 
 
 # ===================== HTTP handlers =====================
@@ -693,7 +1456,7 @@ async def handle_stripe(request):
 
     meta = session.get("metadata") or {}
     claim = meta.get("xzx_claim") or meta.get("claim")
-    product = meta.get("product") or PRICE_TO_PRODUCT.get((session.get("line_items") or {}).get("price_id"))
+    product = meta.get("product") or product_by_price_id((session.get("line_items") or {}).get("price_id"))
 
     if not claim:
         await log_event("webhook_reject", detail=f"no claim on session {session.get('id')}")
@@ -702,7 +1465,7 @@ async def handle_stripe(request):
     if discord_id is None:
         await log_event("webhook_reject", detail="invalid/expired claim token")
         return web.json_response({"error": "invalid claim"}, status=400)
-    if product not in PRODUCTS:
+    if get_product(product) is None:
         await log_event("webhook_reject", detail=f"unknown product on session {session.get('id')}")
         return web.json_response({"error": "unknown product"}, status=400)
 
@@ -712,18 +1475,39 @@ async def handle_stripe(request):
         await log_event("failed", product=product, detail=f"could not fetch user {discord_id}")
         return web.json_response({"error": "user not found"}, status=404)
 
-    ok, result = await deliver(user, product)
+    ok, result = await deliver(user, product, source="stripe", stripe_ref=session.get("id"))
     # Always 200 so Stripe doesn't retry; the bot has logged the outcome.
     return web.json_response({"ok": ok, "result": result}, status=200)
 
 
+async def handle_verify(request):
+    """Your macros POST {key, hwid} here to check a license. Returns {valid, product, reason}."""
+    if VERIFY_API_KEY and request.headers.get("X-Api-Key") != VERIFY_API_KEY:
+        return web.json_response({"valid": False, "reason": "unauthorized"}, status=401)
+    data = {}
+    try:
+        data = await request.json()
+    except Exception:
+        pass
+    key = (data.get("key") or request.query.get("key") or "").strip()
+    hwid = (data.get("hwid") or request.query.get("hwid") or "").strip() or None
+    if not key:
+        return web.json_response({"valid": False, "reason": "missing_key"}, status=400)
+    ok, product, reason = verify_key(key, hwid)
+    await log_event("verify_ok" if ok else "verify_fail", key=key, product=product,
+                    detail=f"hwid={hwid or '-'} • {reason}")
+    return web.json_response({"valid": ok, "product": product, "reason": reason},
+                            status=200 if ok else 403)
+
+
 async def handle_download(request):
     product = request.match_info.get("product", "")
-    if product not in PRODUCTS:
+    prod = get_product(product)
+    if prod is None:
         return web.Response(status=404, text="not found")
     if not verify_link(product, request.query.get("e"), request.query.get("s")):
         return web.Response(status=403, text="invalid or expired link")
-    file_path = PRODUCTS_DIR / PRODUCTS[product]
+    file_path = PRODUCTS_DIR / prod["filename"]
     if not file_path.exists():
         return web.Response(status=404, text="not found")
     return web.FileResponse(file_path,
@@ -739,6 +1523,8 @@ async def start_http():
     app.router.add_get("/login", handle_login)
     app.router.add_get("/callback", handle_callback)
     app.router.add_post("/stripe", handle_stripe)
+    app.router.add_post("/verify", handle_verify)
+    app.router.add_get("/verify", handle_verify)
     app.router.add_get("/dl/{product}", handle_download)
     app.router.add_get("/health", handle_health)
     runner = web.AppRunner(app); await runner.setup()
@@ -761,7 +1547,7 @@ async def on_ready():
 
     # Register persistent ticket views so their buttons work across restarts.
     bot.add_view(TicketLauncher())
-    bot.add_view(TicketCloseView())
+    bot.add_view(TicketControls())
 
     try:
         if GUILD_ID:
@@ -778,5 +1564,5 @@ async def on_ready():
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("Set DISCORD_TOKEN")
-    PRODUCTS_DIR.mkdir(exist_ok=True)
+    PRODUCTS_DIR.mkdir(parents=True, exist_ok=True)
     bot.run(TOKEN)
