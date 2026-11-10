@@ -129,6 +129,41 @@ LOG_COLORS = {
     "warn":           0xFEE75C,
 }
 
+# Per-event presentation: emoji, human title, and a category tag shown in the
+# footer so every feed reads like a branded audit log.
+LOG_META = {
+    "key_generated":  ("🔑", "Key Generated",   "LICENSE"),
+    "linked":         ("🔗", "Account Linked",  "AUTH"),
+    "log_setup":      ("⚙️", "Logs Configured", "SETUP"),
+    "ticket_open":    ("🎫", "Ticket Opened",   "SUPPORT"),
+    "ticket_claim":   ("🙋", "Ticket Claimed",  "SUPPORT"),
+    "ticket_close":   ("📕", "Ticket Closed",   "SUPPORT"),
+    "delivered":      ("📦", "Product Delivered", "SHOP"),
+    "delivered_link": ("📦", "Delivered (Link)",  "SHOP"),
+    "delivered_chan": ("📦", "Delivered (Channel)", "SHOP"),
+    "closed_dms":     ("📪", "DMs Closed",      "SHOP"),
+    "key_revoked":    ("⛔", "Key Revoked",     "LICENSE"),
+    "key_unrevoked":  ("♻️", "Key Restored",    "LICENSE"),
+    "hwid_reset":     ("🖥️", "HWID Reset",      "LICENSE"),
+    "verify_ok":      ("✅", "Key Verified",    "LICENSE"),
+    "verify_fail":    ("🚫", "Verify Failed",   "LICENSE"),
+    "checkout":       ("🛒", "New Purchase",    "SHOP"),
+    "failed":         ("💥", "Delivery Failed", "SHOP"),
+    "webhook_reject": ("🛑", "Webhook Rejected", "SHOP"),
+    "member_join":    ("📥", "Member Joined",   "SERVER"),
+    "member_leave":   ("📤", "Member Left",     "SERVER"),
+    "member_ban":     ("🔨", "Member Banned",   "SERVER"),
+    "member_unban":   ("🕊️", "Member Unbanned", "SERVER"),
+    "msg_delete":     ("🗑️", "Message Deleted", "SERVER"),
+    "msg_edit":       ("✏️", "Message Edited",  "SERVER"),
+    "role_change":    ("🎭", "Roles Updated",   "SERVER"),
+    "channel_change": ("📺", "Channel Updated", "SERVER"),
+    "nick_change":    ("🏷️", "Nickname Changed", "SERVER"),
+    "automod":        ("🤖", "AutoMod Triggered", "MOD"),
+    "mod_action":     ("🛡️", "Mod Action",      "MOD"),
+    "warn":           ("⚠️", "Member Warned",   "MOD"),
+}
+
 # Which saved log channel each event goes to. Missing -> general feed.
 LOG_ROUTES = {
     # shop / purchase feed
@@ -857,16 +892,47 @@ async def log_event(event: str, *, user=None, product=None, key=None, detail=Non
     channel = bot.get_channel(channel_id)
     if channel is None:
         log.error("Log channel %s not found", channel_id); return
-    embed = discord.Embed(title=f"Log — {event.replace('_', ' ').title()}",
-                          color=LOG_COLORS.get(event, 0x2b2d31),
-                          timestamp=datetime.now(timezone.utc))
+
+    emoji, title, cat = LOG_META.get(event, ("📋", event.replace("_", " ").title(), "LOG"))
+    color = LOG_COLORS.get(event, 0x2b2d31)
+    now = datetime.now(timezone.utc)
+
+    embed = discord.Embed(
+        title=f"{emoji}  {title}",
+        color=color,
+        timestamp=now,
+    )
+    # Branded header strip
+    embed.set_author(name=f"{BRAND_NAME} • {cat} LOG",
+                     icon_url=LOGO_URL or discord.utils.MISSING)
+
+    # Accent divider under the header for that "dashboard" feel
+    embed.description = "** **\n" + "▬" * 14
+
+    # User block with avatar thumbnail
     if user and hasattr(user, "mention"):
-        embed.add_field(name="User", value=f"{user.mention} (`{user.id}`)", inline=False)
+        embed.add_field(
+            name="👤 Member",
+            value=f"{user.mention}\n`{user}` • `{user.id}`",
+            inline=True,
+        )
+        try:
+            embed.set_thumbnail(url=user.display_avatar.url)
+        except Exception:
+            pass
     elif user:
-        embed.add_field(name="User", value=f"`{getattr(user, 'id', user)}`", inline=False)
-    if product: embed.add_field(name="Product", value=product, inline=True)
-    if key:     embed.add_field(name="Key", value=f"`{key}`", inline=False)
-    if detail:  embed.add_field(name="Detail", value=detail, inline=False)
+        embed.add_field(name="👤 Member", value=f"`{getattr(user, 'id', user)}`", inline=True)
+
+    if product:
+        embed.add_field(name="📦 Product", value=f"`{product}`", inline=True)
+    if key:
+        embed.add_field(name="🔑 License Key", value=f"```{key}```", inline=False)
+    if detail:
+        embed.add_field(name="📝 Details", value=detail, inline=False)
+
+    footer = f"{BRAND_NAME} Logs • {cat}"
+    embed.set_footer(text=footer, icon_url=LOGO_URL or discord.utils.MISSING)
+
     try:
         await channel.send(embed=embed)
     except discord.HTTPException as e:
@@ -2094,14 +2160,22 @@ async def handle_stripe(request):
         invoice = "—"
         key_line = "—"
 
-    embed = brand_embed("New Purchase",
-                        f"{user.mention} bought **{title}** — {plan_label}.")
-    embed.add_field(name="Status", value=outcome or status_line, inline=True)
-    embed.add_field(name="Plan", value=f"{plan_key or '—'} · {plan_label}", inline=True)
-    embed.add_field(name="Invoice", value=f"`{invoice}`", inline=True)
-    embed.add_field(name="Key", value=f"`{key_line}`", inline=False)
-    embed.add_field(name="Email", value=hidden_field(email), inline=True)
-    embed.add_field(name="IP", value=hidden_field(get_link_ip(discord_id)), inline=True)
+    embed = brand_embed(
+        "🛒  New Purchase",
+        f"** **\n{'▬' * 14}\n{user.mention} just bought **{title}**  •  **{plan_label}**",
+        color=0x57F287 if ok else 0xED4245,
+    )
+    try:
+        embed.set_thumbnail(url=user.display_avatar.url)
+    except Exception:
+        pass
+    embed.add_field(name="📊 Status",  value=outcome or status_line, inline=True)
+    embed.add_field(name="🏷️ Plan",    value=f"`{plan_key or '—'}` · {plan_label}", inline=True)
+    embed.add_field(name="🧾 Invoice", value=f"`{invoice}`", inline=True)
+    embed.add_field(name="👤 Buyer",   value=f"{user.mention}\n`{user}` • `{user.id}`", inline=False)
+    embed.add_field(name="🔑 License Key", value=f"```{key_line}```", inline=False)
+    embed.add_field(name="📧 Email", value=hidden_field(email), inline=True)
+    embed.add_field(name="🌐 IP",    value=hidden_field(get_link_ip(discord_id)), inline=True)
     cid = resolve_log_channel_id("checkout")
     ch = bot.get_channel(cid) if cid else None
     if ch:
