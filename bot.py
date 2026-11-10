@@ -243,6 +243,9 @@ def db_init():
     tcols = {r[1] for r in con.execute("PRAGMA table_info(tickets)").fetchall()}
     if "claimed_by" not in tcols:
         con.execute("ALTER TABLE tickets ADD COLUMN claimed_by INTEGER")
+    lcols = {r[1] for r in con.execute("PRAGMA table_info(links)").fetchall()}
+    if "ip" not in lcols:
+        con.execute("ALTER TABLE links ADD COLUMN ip TEXT")
     con.commit(); con.close()
 
 
@@ -542,10 +545,10 @@ def slugify_plan(name: str) -> str:
     return out
 
 
-def save_link(discord_id: int, username: str):
+def save_link(discord_id: int, username: str, ip: str = None):
     con = sqlite3.connect(DB_PATH)
-    con.execute("INSERT OR REPLACE INTO links (discord_id, username, linked_at) VALUES (?, ?, ?)",
-                (discord_id, username, datetime.now(timezone.utc).isoformat()))
+    con.execute("INSERT OR REPLACE INTO links (discord_id, username, linked_at, ip) VALUES (?, ?, ?, ?)",
+                (discord_id, username, datetime.now(timezone.utc).isoformat(), ip))
     con.commit(); con.close()
 
 
@@ -554,6 +557,13 @@ def is_linked(discord_id: int) -> bool:
     row = con.execute("SELECT 1 FROM links WHERE discord_id = ?", (discord_id,)).fetchone()
     con.close()
     return row is not None
+
+
+def get_link_ip(discord_id: int):
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute("SELECT ip FROM links WHERE discord_id = ?", (discord_id,)).fetchone()
+    con.close()
+    return row[0] if row and row[0] else None
 
 
 def get_setting(key: str):
@@ -865,35 +875,38 @@ async def log_event(event: str, *, user=None, product=None, key=None, detail=Non
 
 async def deliver(user: discord.abc.User, product: str,
                   source: str = "manual", stripe_ref: str = None,
-                  duration: str = "lifetime") -> tuple[bool, str]:
+                  duration: str = "lifetime", log_internally: bool = True) -> tuple[bool, str]:
+    async def dlog(*a, **k):
+        if log_internally:
+            await log_event(*a, **k)
     prod = get_product(product)
     if prod is None:
-        await log_event("failed", user=user, product=product, detail="unknown product")
+        await dlog("failed", user=user, product=product, detail="unknown product")
         return False, f"Unknown product: {product}"
     if duration not in DURATIONS:
         duration = "lifetime"
     # Website purchases must be OAuth-verified. Staff deliveries are trusted and
     # always DM, even if the recipient never linked their account.
     if source == "stripe" and not is_linked(user.id):
-        await log_event("failed", user=user, product=product, detail="not linked via oauth")
+        await dlog("failed", user=user, product=product, detail="not linked via oauth")
         return False, "buyer has not linked their Discord account"
 
     file_path = PRODUCTS_DIR / prod["filename"]
     if not file_path.exists():
-        await log_event("failed", user=user, product=product, detail="file missing on disk")
+        await dlog("failed", user=user, product=product, detail="file missing on disk")
         return False, f"Product file not found for {product}"
 
     key = generate_key(product, duration)
     bind_key(key, user.id)
     invoice_id = generate_invoice_id()
     record_purchase(invoice_id, user.id, product, key, source, stripe_ref)
-    await log_event("key_generated", user=user, product=product, key=key,
+    await dlog("key_generated", user=user, product=product, key=key,
                     detail=f"invoice {invoice_id} • {duration}")
 
     size = file_path.stat().st_size
     use_link = size > ATTACH_LIMIT_BYTES
     if use_link and not PUBLIC_BASE_URL:
-        await log_event("failed", user=user, product=product, key=key,
+        await dlog("failed", user=user, product=product, key=key,
                         detail=f"file {size}B over limit, PUBLIC_BASE_URL unset")
         return False, "file too large and no download host configured"
 
@@ -925,20 +938,20 @@ async def deliver(user: discord.abc.User, product: str,
     # 1) Try the DM.
     try:
         await send_to(user)
-        await log_event("delivered" if not use_link else "delivered_link",
+        await dlog("delivered" if not use_link else "delivered_link",
                         user=user, product=product, key=key, detail=f"invoice {invoice_id}")
         return True, key
     except discord.Forbidden:
         pass  # DMs closed — fall through to channel delivery
     except discord.HTTPException as e:
-        await log_event("failed", user=user, product=product, key=key, detail=str(e))
+        await dlog("failed", user=user, product=product, key=key, detail=str(e))
         return False, f"send_failed: {e}"
 
     # 2) DMs are closed: deliver into a private channel so the paid buyer still gets it.
     guild = bot.get_guild(GUILD_ID) if GUILD_ID else None
     member = guild.get_member(user.id) if guild else None
     if guild is None or member is None:
-        await log_event("closed_dms", user=user, product=product, key=key,
+        await dlog("closed_dms", user=user, product=product, key=key,
                         detail="DMs closed and buyer not reachable in the server")
         return False, "closed_dms"
 
@@ -960,15 +973,15 @@ async def deliver(user: discord.abc.User, product: str,
             reason="Buyer has DMs closed; delivering in a private channel",
         )
         await send_to(channel, content=f"{member.mention} your DMs are closed, so here's your order:")
-        await log_event("delivered_chan", user=user, product=product, key=key,
+        await dlog("delivered_chan", user=user, product=product, key=key,
                         detail=f"invoice {invoice_id} in #{channel.name}")
         return True, key
     except discord.Forbidden:
-        await log_event("closed_dms", user=user, product=product, key=key,
+        await dlog("closed_dms", user=user, product=product, key=key,
                         detail="DMs closed and no Manage Channels permission for fallback")
         return False, "closed_dms"
     except discord.HTTPException as e:
-        await log_event("failed", user=user, product=product, key=key, detail=str(e))
+        await dlog("failed", user=user, product=product, key=key, detail=str(e))
         return False, f"send_failed: {e}"
 
 
@@ -1973,8 +1986,9 @@ async def handle_callback(request):
             me = await r.json()
 
     discord_id = int(me["id"]); username = me.get("username", "unknown")
-    save_link(discord_id, username)
-    await log_event("linked", user=await bot.fetch_user(discord_id), detail="account linked via oauth")
+    save_link(discord_id, username, client_ip(request))
+    await log_event("linked", user=await bot.fetch_user(discord_id),
+                    detail=f"logged in • IP {hidden_field(client_ip(request))}")
 
     claim = mint_claim(discord_id, plan_key)
 
@@ -2059,14 +2073,43 @@ async def handle_stripe(request):
         await log_event("failed", product=product, detail=f"could not fetch user {discord_id}")
         return web.json_response({"error": "user not found"}, status=404)
 
-    # Log the checkout with the buyer's email (hidden) before delivering.
     email = ((session.get("customer_details") or {}).get("email")
              or session.get("customer_email") or "")
-    await log_event("checkout", user=user, product=product,
-                    detail=f"plan {plan_key or '-'} • {duration} • email {hidden_field(email)}")
 
+    # Deliver quietly, then write ONE clean purchase log with everything.
     ok, result = await deliver(user, product, source="stripe",
-                               stripe_ref=session.get("id"), duration=duration)
+                               stripe_ref=session.get("id"), duration=duration,
+                               log_internally=False)
+
+    prod = get_product(product) or {}
+    title = prod.get("display_name") or product
+    plan_label = "Lifetime" if duration == "lifetime" else f"1 {duration}"
+    outcome = {"closed_dms": "⚠ delivered to channel / DMs closed"}.get(result, None)
+    if ok:
+        status_line = "✅ delivered"
+        invoice = invoice_for_key(result) or "—"
+        key_line = result
+    else:
+        status_line = f"❌ {result}"
+        invoice = "—"
+        key_line = "—"
+
+    embed = brand_embed("New Purchase",
+                        f"{user.mention} bought **{title}** — {plan_label}.")
+    embed.add_field(name="Status", value=outcome or status_line, inline=True)
+    embed.add_field(name="Plan", value=f"{plan_key or '—'} · {plan_label}", inline=True)
+    embed.add_field(name="Invoice", value=f"`{invoice}`", inline=True)
+    embed.add_field(name="Key", value=f"`{key_line}`", inline=False)
+    embed.add_field(name="Email", value=hidden_field(email), inline=True)
+    embed.add_field(name="IP", value=hidden_field(get_link_ip(discord_id)), inline=True)
+    cid = resolve_log_channel_id("checkout")
+    ch = bot.get_channel(cid) if cid else None
+    if ch:
+        try:
+            await ch.send(embed=embed)
+        except discord.HTTPException as e:
+            log.error("Could not post purchase log: %s", e)
+
     # Always 200 so Stripe doesn't retry; the bot has logged the outcome.
     return web.json_response({"ok": ok, "result": result}, status=200)
 
