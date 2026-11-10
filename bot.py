@@ -14,6 +14,7 @@ Everything logs to a rotating file and a Discord log channel.
 
 import os
 import io
+import base64
 import asyncio
 import sqlite3
 import secrets
@@ -213,6 +214,16 @@ def db_init():
             mod_id      INTEGER,
             reason      TEXT,
             created_at  TEXT NOT NULL
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS plans (
+            plan_key     TEXT PRIMARY KEY,
+            product      TEXT,
+            duration     TEXT,
+            payment_link TEXT,
+            label        TEXT,
+            created_at   TEXT NOT NULL
         )
     """)
     # Migration-safe column adds for existing databases.
@@ -487,6 +498,48 @@ def slugify_product(name: str) -> str:
     return out or "product"
 
 
+# ----- Plans (a purchase option: product + duration + Stripe payment link) -----
+def add_plan(plan_key: str, product: str, duration: str, payment_link: str, label: str = None):
+    con = sqlite3.connect(DB_PATH)
+    con.execute(
+        "INSERT OR REPLACE INTO plans (plan_key, product, duration, payment_link, label, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (plan_key, product, duration, payment_link, label or plan_key.title(),
+         datetime.now(timezone.utc).isoformat()),
+    )
+    con.commit(); con.close()
+
+
+def get_plan(plan_key: str):
+    if not plan_key:
+        return None
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    row = con.execute("SELECT * FROM plans WHERE plan_key = ?", (plan_key,)).fetchone()
+    con.close()
+    return dict(row) if row else None
+
+
+def list_plans():
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    rows = con.execute("SELECT * FROM plans ORDER BY created_at").fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+
+def remove_plan(plan_key: str) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.execute("DELETE FROM plans WHERE plan_key = ?", (plan_key,))
+    con.commit(); changed = cur.rowcount; con.close()
+    return changed > 0
+
+
+def slugify_plan(name: str) -> str:
+    out = "".join(c.lower() if (c.isalnum() or c == "-") else "" for c in (name or ""))[:40]
+    return out
+
+
 def save_link(discord_id: int, username: str):
     con = sqlite3.connect(DB_PATH)
     con.execute("INSERT OR REPLACE INTO links (discord_id, username, linked_at) VALUES (?, ?, ?)",
@@ -688,36 +741,47 @@ def verify_link(product: str, expires: str, sig: str) -> bool:
     return hmac.compare_digest(_sign(LINK_SECRET, f"{product}:{exp}"), sig or "")
 
 
-def make_state() -> str:
+def make_state(plan: str = "") -> str:
     nonce = secrets.token_urlsafe(16); ts = str(int(time.time()))
-    return f"{nonce}.{ts}.{_sign(OAUTH_STATE_SECRET, f'{nonce}:{ts}')}"
+    sig = _sign(OAUTH_STATE_SECRET, f"{nonce}:{ts}:{plan}")
+    return f"{nonce}.{ts}.{plan}.{sig}"
 
 
-def verify_state(state: str, max_age: int = 600) -> bool:
+def verify_state(state: str, max_age: int = 600):
+    """Return the plan string (possibly empty) if valid, else None."""
     try:
-        nonce, ts, sig = state.split(".")
+        nonce, ts, plan, sig = state.split(".")
     except (ValueError, AttributeError):
-        return False
+        return None
     if int(time.time()) - int(ts) > max_age:
-        return False
-    return hmac.compare_digest(_sign(OAUTH_STATE_SECRET, f"{nonce}:{ts}"), sig)
+        return None
+    if not hmac.compare_digest(_sign(OAUTH_STATE_SECRET, f"{nonce}:{ts}:{plan}"), sig):
+        return None
+    return plan
 
 
-def mint_claim(discord_id: int) -> str:
+def mint_claim(discord_id: int, plan: str = "") -> str:
+    """URL/Stripe-safe signed token carrying the Discord ID and chosen plan."""
     exp = int(time.time()) + CLAIM_TTL
-    return f"{discord_id}.{exp}.{_sign(OAUTH_STATE_SECRET, f'{discord_id}:{exp}')}"
+    body = f"{discord_id}:{exp}:{plan}"
+    sig = _sign(OAUTH_STATE_SECRET, body)
+    raw = f"{body}:{sig}".encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
 
 def verify_claim(token: str):
+    """Return (discord_id, plan) if valid, else None."""
     try:
-        did, exp, sig = token.split(".")
-    except (ValueError, AttributeError):
+        pad = "=" * (-len(token) % 4)
+        raw = base64.urlsafe_b64decode(token + pad).decode()
+        did, exp, plan, sig = raw.split(":")
+    except Exception:
         return None
     if int(time.time()) > int(exp):
         return None
-    if not hmac.compare_digest(_sign(OAUTH_STATE_SECRET, f"{did}:{exp}"), sig):
+    if not hmac.compare_digest(_sign(OAUTH_STATE_SECRET, f"{did}:{exp}:{plan}"), sig):
         return None
-    return int(did)
+    return int(did), plan
 
 
 # ===================== Bot =====================
@@ -1213,6 +1277,74 @@ async def product_list(interaction: discord.Interaction):
 bot.tree.add_command(product_group)
 
 
+# ===================== Plans (purchase options) =====================
+plan_group = app_commands.Group(name="plan", description="Manage purchase plans (staff only).")
+
+
+async def plan_autocomplete(interaction: discord.Interaction, current: str):
+    current = (current or "").lower()
+    return [app_commands.Choice(name=p["plan_key"], value=p["plan_key"])
+            for p in list_plans() if current in p["plan_key"].lower()][:25]
+
+
+@plan_group.command(name="add", description="Add a purchase plan linked to a Stripe payment link.")
+@app_commands.describe(key="Short plan key, e.g. day", product="Which product this plan delivers",
+                       duration="Access length", payment_link="The Stripe payment link URL",
+                       label="Nice label shown to buyers (optional)")
+@app_commands.autocomplete(product=product_autocomplete)
+@app_commands.choices(duration=[app_commands.Choice(name=d, value=d) for d in DURATIONS])
+async def plan_add(interaction: discord.Interaction, key: str, product: str,
+                   duration: app_commands.Choice[str], payment_link: str, label: str = None):
+    if not is_staff(interaction):
+        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        return
+    plan_key = slugify_plan(key)
+    if not plan_key:
+        await interaction.response.send_message("Give the plan a simple key like `day`.", ephemeral=True)
+        return
+    if get_product(product) is None:
+        await interaction.response.send_message(
+            f"No product named `{product}`. Add it with `/product add` first.", ephemeral=True)
+        return
+    if not payment_link.startswith("https://"):
+        await interaction.response.send_message("The payment link should be a full https URL.", ephemeral=True)
+        return
+    add_plan(plan_key, product, duration.value, payment_link, label)
+    base = PUBLIC_BASE_URL.rstrip("/") if PUBLIC_BASE_URL else ""
+    await interaction.response.send_message(
+        f"Added plan **{label or plan_key}** (`{plan_key}`): {duration.value} of **{product}**.\n"
+        f"Link your buy button to `{base}/buy?plan={plan_key}`.", ephemeral=True)
+
+
+@plan_group.command(name="list", description="List all purchase plans.")
+async def plan_list(interaction: discord.Interaction):
+    if not is_staff(interaction):
+        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        return
+    plans = list_plans()
+    if not plans:
+        await interaction.response.send_message("No plans yet. Add one with `/plan add`.", ephemeral=True)
+        return
+    lines = [f"**{p['label'] or p['plan_key']}** (`{p['plan_key']}`) — {p['duration']} of `{p['product']}`"
+             for p in plans]
+    await interaction.response.send_message(
+        embed=brand_embed("Plans", "\n".join(lines)), ephemeral=True)
+
+
+@plan_group.command(name="remove", description="Remove a purchase plan.")
+@app_commands.autocomplete(key=plan_autocomplete)
+async def plan_remove(interaction: discord.Interaction, key: str):
+    if not is_staff(interaction):
+        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        return
+    ok = remove_plan(slugify_plan(key))
+    await interaction.response.send_message(
+        f"Removed plan `{key}`." if ok else f"No plan named `{key}`.", ephemeral=True)
+
+
+bot.tree.add_command(plan_group)
+
+
 # ===================== Key management =====================
 async def send_existing_key(user: discord.abc.User, row: dict) -> tuple[bool, str]:
     """Re-send an existing key + file to its owner (used by /key resend)."""
@@ -1400,6 +1532,8 @@ async def help_cmd(interaction: discord.Interaction):
             name="Products & delivery (staff)",
             value="`/product add` — add a product + file\n"
                   "`/product list` · `/product remove`\n"
+                  "`/plan add` — link a Stripe payment link to a product + duration\n"
+                  "`/plan list` · `/plan remove`\n"
                   "`/deliver` — manually deliver to a buyer\n"
                   "`/stats` — sales stats", inline=False)
         e.add_field(
@@ -1769,11 +1903,12 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 
 
 # ===================== HTTP handlers =====================
-async def handle_login(_request):
+async def handle_login(request):
     if not OAUTH_CLIENT_ID or not OAUTH_REDIRECT_URI:
         return web.Response(status=500, text="OAuth not configured")
+    plan = slugify_plan(request.query.get("plan", ""))
     params = (f"client_id={OAUTH_CLIENT_ID}&redirect_uri={OAUTH_REDIRECT_URI}"
-              f"&response_type=code&scope=identify&state={make_state()}&prompt=consent")
+              f"&response_type=code&scope=identify&state={make_state(plan)}&prompt=consent")
     raise web.HTTPFound(f"{DISCORD_API}/oauth2/authorize?{params}")
 
 
@@ -1781,7 +1916,8 @@ async def handle_callback(request):
     if request.query.get("error"):
         return web.Response(status=400, text=f"Authorization cancelled: {request.query['error']}")
     code, state = request.query.get("code"), request.query.get("state")
-    if not code or not verify_state(state):
+    plan_key = verify_state(state)
+    if not code or plan_key is None:
         await log_event("webhook_reject", detail="oauth: bad code/state")
         return web.Response(status=400, text="Invalid or expired login. Please try again.")
 
@@ -1805,13 +1941,27 @@ async def handle_callback(request):
     save_link(discord_id, username)
     await log_event("linked", user=await bot.fetch_user(discord_id), detail="account linked via oauth")
 
-    claim = mint_claim(discord_id)
+    claim = mint_claim(discord_id, plan_key)
+
+    # Buying a plan: send them to that plan's Stripe payment link with the claim attached.
+    plan = get_plan(plan_key) if plan_key else None
+    if plan_key and plan and plan.get("payment_link"):
+        url = plan["payment_link"]
+        sep = "&" if "?" in url else "?"
+        raise web.HTTPFound(f"{url}{sep}client_reference_id={claim}")
+    if plan_key and not plan:
+        return web.Response(
+            text=f"Linked as {username}. That plan isn't set up yet — contact support.",
+            content_type="text/plain")
+
+    # Legacy custom checkout (optional).
     if STORE_CHECKOUT_URL:
         sep = "&" if "?" in STORE_CHECKOUT_URL else "?"
-        resp = web.HTTPFound(f"{STORE_CHECKOUT_URL}{sep}xzx_claim={claim}")
+        resp = web.HTTPFound(f"{STORE_CHECKOUT_URL}{sep}client_reference_id={claim}")
         resp.set_cookie("xzx_claim", claim, max_age=CLAIM_TTL, httponly=True, secure=True, samesite="Lax")
         raise resp
-    return web.Response(text=f"Linked as {username}. Verified.\n\nClaim token:\n{claim}\n\nReturn to checkout.",
+
+    return web.Response(text=f"Linked as {username}. Verified. You can head back and pick a plan.",
                         content_type="text/plain")
 
 
@@ -1843,18 +1993,29 @@ async def handle_stripe(request):
         return web.json_response({"ignored": "unpaid"}, status=200)
 
     meta = session.get("metadata") or {}
-    claim = meta.get("xzx_claim") or meta.get("claim")
-    product = meta.get("product") or product_by_price_id((session.get("line_items") or {}).get("price_id"))
+    # Payment Links carry the Discord claim in client_reference_id; Checkout Sessions in metadata.
+    claim = session.get("client_reference_id") or meta.get("xzx_claim") or meta.get("claim")
 
     if not claim:
         await log_event("webhook_reject", detail=f"no claim on session {session.get('id')}")
         return web.json_response({"error": "no claim token"}, status=400)
-    discord_id = verify_claim(claim)
-    if discord_id is None:
+    decoded = verify_claim(claim)
+    if decoded is None:
         await log_event("webhook_reject", detail="invalid/expired claim token")
         return web.json_response({"error": "invalid claim"}, status=400)
+    discord_id, plan_key = decoded
+
+    # Resolve product + duration: from the plan the buyer chose, else from metadata.
+    plan = get_plan(plan_key) if plan_key else None
+    if plan:
+        product, duration = plan["product"], (plan["duration"] or "lifetime").lower()
+    else:
+        product = meta.get("product") or product_by_price_id((session.get("line_items") or {}).get("price_id"))
+        duration = (meta.get("duration") or "lifetime").lower()
+
     if get_product(product) is None:
-        await log_event("webhook_reject", detail=f"unknown product on session {session.get('id')}")
+        await log_event("webhook_reject",
+                        detail=f"unknown product/plan on session {session.get('id')} (plan={plan_key})")
         return web.json_response({"error": "unknown product"}, status=400)
 
     try:
@@ -1863,7 +2024,6 @@ async def handle_stripe(request):
         await log_event("failed", product=product, detail=f"could not fetch user {discord_id}")
         return web.json_response({"error": "user not found"}, status=404)
 
-    duration = (meta.get("duration") or "lifetime").lower()
     ok, result = await deliver(user, product, source="stripe",
                                stripe_ref=session.get("id"), duration=duration)
     # Always 200 so Stripe doesn't retry; the bot has logged the outcome.
@@ -1920,6 +2080,7 @@ async def handle_health(_r):
 async def start_http():
     app = web.Application()
     app.router.add_get("/login", handle_login)
+    app.router.add_get("/buy", handle_login)
     app.router.add_get("/callback", handle_callback)
     app.router.add_post("/stripe", handle_stripe)
     app.router.add_post("/verify", handle_verify)
