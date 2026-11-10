@@ -754,6 +754,12 @@ def mask_email(email: str) -> str:
     return f"{(local[:1] or '•')}•••@{domain}"
 
 
+def hidden_field(value: str) -> str:
+    """A Discord spoiler: hidden/blurred until a staff member clicks it, then shows in full."""
+    value = (value or "").strip()
+    return f"||{value}||" if value else "—"
+
+
 def make_download_url(product: str) -> str:
     exp = int(time.time()) + LINK_TTL
     sig = _sign(LINK_SECRET, f"{product}:{exp}")
@@ -2057,7 +2063,7 @@ async def handle_stripe(request):
     email = ((session.get("customer_details") or {}).get("email")
              or session.get("customer_email") or "")
     await log_event("checkout", user=user, product=product,
-                    detail=f"plan {plan_key or '-'} • {duration} • email {mask_email(email)}")
+                    detail=f"plan {plan_key or '-'} • {duration} • email {hidden_field(email)}")
 
     ok, result = await deliver(user, product, source="stripe",
                                stripe_ref=session.get("id"), duration=duration)
@@ -2081,7 +2087,7 @@ async def handle_verify(request):
     ok, product, reason = verify_key(key, hwid)
     ip = client_ip(request)
     await log_event("verify_ok" if ok else "verify_fail", key=key, product=product,
-                    detail=f"IP {mask_ip(ip)} • HWID `{hwid or '-'}` • {reason}")
+                    detail=f"IP {hidden_field(ip)} • HWID `{hwid or '-'}` • {reason}")
     return web.json_response({"valid": ok, "product": product, "reason": reason},
                             status=200 if ok else 403)
 
