@@ -111,6 +111,7 @@ LOG_COLORS = {
     "hwid_reset":     0x5865F2,
     "verify_ok":      0x57F287,
     "verify_fail":    0xFEE75C,
+    "checkout":       0x57F287,
     "failed":         0xED4245,
     "webhook_reject": 0xED4245,
     # server logs
@@ -133,6 +134,7 @@ LOG_ROUTES = {
     # shop / purchase feed
     "key_generated": "log_shop", "delivered": "log_shop", "delivered_link": "log_shop",
     "delivered_chan": "log_shop", "closed_dms": "log_shop", "webhook_reject": "log_shop",
+    "checkout": "log_shop",
     # license-key feed
     "verify_ok": "log_key", "verify_fail": "log_key", "key_revoked": "log_key",
     "key_unrevoked": "log_key", "hwid_reset": "log_key",
@@ -723,6 +725,33 @@ def clear_warnings(guild_id: int, user_id: int) -> int:
 # ===================== Signed tokens (links / state / claims) =====================
 def _sign(secret: str, msg: str) -> str:
     return hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
+
+
+def client_ip(request) -> str:
+    """Real client IP behind Railway's proxy (X-Forwarded-For), else the peer address."""
+    xff = request.headers.get("X-Forwarded-For", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.remote or ""
+
+
+def mask_ip(ip: str) -> str:
+    """Hide most of an IP for logs: 203.0.113.7 -> 203.•.•.•"""
+    ip = (ip or "").strip()
+    if not ip:
+        return "unknown"
+    if ":" in ip:  # IPv6
+        return ip.split(":")[0] + ":••••"
+    parts = ip.split(".")
+    return f"{parts[0]}.•.•.•" if len(parts) == 4 else "••••"
+
+
+def mask_email(email: str) -> str:
+    """Hide most of an email for logs: cooper@gmail.com -> c•••@gmail.com"""
+    if not email or "@" not in email:
+        return "hidden"
+    local, _, domain = email.partition("@")
+    return f"{(local[:1] or '•')}•••@{domain}"
 
 
 def make_download_url(product: str) -> str:
@@ -2024,6 +2053,12 @@ async def handle_stripe(request):
         await log_event("failed", product=product, detail=f"could not fetch user {discord_id}")
         return web.json_response({"error": "user not found"}, status=404)
 
+    # Log the checkout with the buyer's email (hidden) before delivering.
+    email = ((session.get("customer_details") or {}).get("email")
+             or session.get("customer_email") or "")
+    await log_event("checkout", user=user, product=product,
+                    detail=f"plan {plan_key or '-'} • {duration} • email {mask_email(email)}")
+
     ok, result = await deliver(user, product, source="stripe",
                                stripe_ref=session.get("id"), duration=duration)
     # Always 200 so Stripe doesn't retry; the bot has logged the outcome.
@@ -2044,8 +2079,9 @@ async def handle_verify(request):
     if not key:
         return web.json_response({"valid": False, "reason": "missing_key"}, status=400)
     ok, product, reason = verify_key(key, hwid)
+    ip = client_ip(request)
     await log_event("verify_ok" if ok else "verify_fail", key=key, product=product,
-                    detail=f"hwid={hwid or '-'} • {reason}")
+                    detail=f"IP {mask_ip(ip)} • HWID `{hwid or '-'}` • {reason}")
     return web.json_response({"valid": ok, "product": product, "reason": reason},
                             status=200 if ok else 403)
 
