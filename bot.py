@@ -682,13 +682,21 @@ def member_is_staff(member: discord.Member) -> bool:
     return bool(rid) and any(r.id == rid for r in roles)
 
 
-def brand_embed(title: str, description: str = None, color: int = None) -> discord.Embed:
+def brand_embed(title: str, description: str = None, color: int = None,
+                thumb: str = None, author_sub: str = None) -> discord.Embed:
     """A dark, clean embed branded with the logo as a circular icon (no big white image)."""
     e = discord.Embed(title=title, description=description,
                       color=color if color is not None else BRAND_COLOR,
                       timestamp=datetime.now(timezone.utc))
-    e.set_author(name=BRAND_NAME, icon_url=LOGO_URL)
-    e.set_footer(text=BRAND_NAME, icon_url=LOGO_URL)
+    author_name = f"{BRAND_NAME} • {author_sub}" if author_sub else BRAND_NAME
+    e.set_author(name=author_name, icon_url=LOGO_URL or discord.utils.MISSING)
+    e.set_footer(text=f"{BRAND_NAME} • Secure Delivery",
+                 icon_url=LOGO_URL or discord.utils.MISSING)
+    if thumb:
+        try:
+            e.set_thumbnail(url=thumb)
+        except Exception:
+            pass
     return e
 
 
@@ -981,18 +989,24 @@ async def deliver(user: discord.abc.User, product: str,
     plan_label = "Lifetime" if duration == "lifetime" else f"1 {duration}"
 
     def build_embed() -> discord.Embed:
-        e = brand_embed("Purchase Delivered",
-                        f"Thanks for buying **{title}**. Keep your key private — one key, one user.")
-        e.add_field(name="Invoice ID", value=f"`{invoice_id}`", inline=True)
-        e.add_field(name="Product", value=title, inline=True)
-        e.add_field(name="Plan", value=plan_label, inline=True)
-        e.add_field(name="License Key", value=f"```{key}```", inline=False)
+        e = brand_embed(
+            "📦  Purchase Delivered",
+            f"** **\n{'▬' * 14}\nThanks for buying **{title}** 🦈\n"
+            f"Keep your key private — **one key, one user.**",
+            color=0x57F287,
+            author_sub="ORDER COMPLETE",
+            thumb=getattr(getattr(user, "display_avatar", None), "url", None),
+        )
+        e.add_field(name="🧾 Invoice ID", value=f"`{invoice_id}`", inline=True)
+        e.add_field(name="📦 Product", value=title, inline=True)
+        e.add_field(name="🏷️ Plan", value=plan_label, inline=True)
+        e.add_field(name="🔑 License Key", value=f"```{key}```", inline=False)
         if use_link:
-            e.add_field(name="Download",
+            e.add_field(name="⬇️ Download",
                         value=f"[Download {file_path.name}]({make_download_url(product)})\n"
                               f"Link expires in {LINK_TTL // 60} min.", inline=False)
         else:
-            e.add_field(name="File", value=file_path.name, inline=False)
+            e.add_field(name="📁 File", value=file_path.name, inline=False)
         return e
 
     async def send_to(dest, content=None):
@@ -1102,17 +1116,17 @@ async def stats(interaction: discord.Interaction):
     finally:
         con.close()
 
-    embed = discord.Embed(title="Stats", color=0x5865F2, timestamp=datetime.now(timezone.utc))
+    embed = brand_embed("📊  Stats", f"** **\n{'▬' * 14}", author_sub="DASHBOARD")
     if per_product:
         lines = "\n".join(
             f"**{p.replace('_', ' ').title()}** — {total} keys ({bound} delivered)"
             for p, total, bound in per_product
         )
-        embed.add_field(name="Per Product", value=lines, inline=False)
+        embed.add_field(name="📦 Per Product", value=lines, inline=False)
     else:
-        embed.add_field(name="Per Product", value="No keys issued yet.", inline=False)
-    embed.add_field(name="Total Keys", value=str(total_keys), inline=True)
-    embed.add_field(name="Linked Accounts", value=str(total_linked), inline=True)
+        embed.add_field(name="📦 Per Product", value="No keys issued yet.", inline=False)
+    embed.add_field(name="🔑 Total Keys", value=f"**{total_keys}**", inline=True)
+    embed.add_field(name="🔗 Linked Accounts", value=f"**{total_linked}**", inline=True)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -1166,7 +1180,7 @@ async def setup_status(interaction: discord.Interaction):
         f"**Stripe payments:** {'configured' if STRIPE_WEBHOOK_SECRET else 'not set (optional)'}",
         f"**Server logs intent:** {'on' if SERVER_LOGS else 'off (set SERVER_LOGS=1)'}",
     ]
-    embed = brand_embed("Setup Status", "\n".join(lines))
+    embed = brand_embed("⚙️  Setup Status", "\n".join(lines), author_sub="CONFIG")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -1264,7 +1278,7 @@ async def setup_automod(interaction: discord.Interaction, invites: bool = None,
         state = {n: get_setting("automod_" + n) == "1"
                  for n in ("invites", "spam", "mentions")}
         lines = "\n".join(f"**{k.title()}:** {'on' if v else 'off'}" for k, v in state.items())
-        await interaction.response.send_message(embed=brand_embed("Automod", lines), ephemeral=True)
+        await interaction.response.send_message(embed=brand_embed("🤖  AutoMod", lines, author_sub="MOD"), ephemeral=True)
         return
     note = "" if SERVER_LOGS else ("\n\N{WARNING SIGN} Invite/spam filters need message content: set "
                                    "`SERVER_LOGS=1` and enable the **Message Content Intent**.")
@@ -1385,7 +1399,7 @@ async def product_list(interaction: discord.Interaction):
         price = f" • `{p['price_id']}`" if p.get("price_id") else ""
         lines.append(f"**{p['display_name'] or p['name']}** — `{p['name']}` ({p['filename']}){price}")
     await interaction.response.send_message(
-        embed=brand_embed("Products", "\n".join(lines)), ephemeral=True)
+        embed=brand_embed("📦  Products", "\n".join(lines), author_sub="CATALOG"), ephemeral=True)
 
 
 bot.tree.add_command(product_group)
@@ -1442,7 +1456,7 @@ async def plan_list(interaction: discord.Interaction):
     lines = [f"**{p['label'] or p['plan_key']}** (`{p['plan_key']}`) — {p['duration']} of `{p['product']}`"
              for p in plans]
     await interaction.response.send_message(
-        embed=brand_embed("Plans", "\n".join(lines)), ephemeral=True)
+        embed=brand_embed("🏷️  Plans", "\n".join(lines), author_sub="PRICING"), ephemeral=True)
 
 
 @plan_group.command(name="remove", description="Remove a purchase plan.")
@@ -1467,14 +1481,18 @@ async def send_existing_key(user: discord.abc.User, row: dict) -> tuple[bool, st
         return False, "product no longer exists"
     key = row["key"]
     fp = PRODUCTS_DIR / prod["filename"]
-    e = brand_embed("Your License",
-                    f"Here's your **{prod.get('display_name') or row['product']}** again. "
-                    f"Keep your key private — one key, one user.")
+    e = brand_embed(
+        "🔑  Your License",
+        f"** **\n{'▬' * 14}\nHere's your **{prod.get('display_name') or row['product']}** again 🦈\n"
+        f"Keep your key private — **one key, one user.**",
+        author_sub="KEY RESEND",
+        thumb=getattr(getattr(user, "display_avatar", None), "url", None),
+    )
     inv = invoice_for_key(key)
     if inv:
-        e.add_field(name="Invoice ID", value=f"`{inv}`", inline=True)
-    e.add_field(name="Product", value=prod.get("display_name") or row["product"], inline=True)
-    e.add_field(name="License Key", value=f"```{key}```", inline=False)
+        e.add_field(name="🧾 Invoice ID", value=f"`{inv}`", inline=True)
+    e.add_field(name="📦 Product", value=prod.get("display_name") or row["product"], inline=True)
+    e.add_field(name="🔑 License Key", value=f"```{key}```", inline=False)
     try:
         if fp.exists() and fp.stat().st_size <= ATTACH_LIMIT_BYTES:
             await user.send(embed=e, file=discord.File(fp))
@@ -1504,13 +1522,13 @@ async def key_lookup(interaction: discord.Interaction, key: str):
         await interaction.response.send_message("No such key.", ephemeral=True)
         return
     owner = f"<@{row['discord_id']}>" if row.get("discord_id") else "unbound"
-    e = brand_embed("Key Lookup")
-    e.add_field(name="Key", value=f"`{row['key']}`", inline=False)
-    e.add_field(name="Product", value=row.get("product") or "—", inline=True)
-    e.add_field(name="Owner", value=owner, inline=True)
-    e.add_field(name="Revoked", value="yes" if row.get("revoked") else "no", inline=True)
-    e.add_field(name="HWID", value=f"`{row['hwid']}`" if row.get("hwid") else "not bound", inline=False)
-    e.add_field(name="Last used", value=(row.get("last_used_at") or "never")[:19], inline=True)
+    e = brand_embed("🔍  Key Lookup", author_sub="LICENSE")
+    e.add_field(name="🔑 Key", value=f"`{row['key']}`", inline=False)
+    e.add_field(name="📦 Product", value=row.get("product") or "—", inline=True)
+    e.add_field(name="👤 Owner", value=owner, inline=True)
+    e.add_field(name="⛔ Revoked", value="🔴 yes" if row.get("revoked") else "🟢 no", inline=True)
+    e.add_field(name="🖥️ HWID", value=f"`{row['hwid']}`" if row.get("hwid") else "not bound", inline=False)
+    e.add_field(name="🕐 Last used", value=(row.get("last_used_at") or "never")[:19], inline=True)
     await interaction.response.send_message(embed=e, ephemeral=True)
 
 
@@ -1623,15 +1641,18 @@ async def keys_cmd(interaction: discord.Interaction, member: discord.Member):
         flags = " \N{CROSS MARK} revoked" if r.get("revoked") else ""
         lines.append(f"`{r['key']}` — {r.get('product') or '—'}{flags}")
     await interaction.response.send_message(
-        embed=brand_embed(f"Keys for {member.display_name}", "\n".join(lines[:25])), ephemeral=True)
+        embed=brand_embed(f"🔑  Keys for {member.display_name}", "\n".join(lines[:25]),
+                          author_sub="LICENSE", thumb=member.display_avatar.url), ephemeral=True)
 
 
 @bot.tree.command(name="help", description="Show what this bot can do.")
 async def help_cmd(interaction: discord.Interaction):
     staff = is_staff(interaction)
-    e = brand_embed(f"{BRAND_NAME} — Help",
+    e = brand_embed(f"📖  {BRAND_NAME} Help",
+                    f"** **\n{'▬' * 14}\n"
                     "Buy from the website and the bot DMs you your product and license key. "
-                    "Open a ticket for support using your invoice ID.")
+                    "Open a ticket for support using your invoice ID.",
+                    author_sub="COMMANDS")
     e.add_field(name="Everyone",
                 value="`/help` — this menu", inline=False)
     if staff:
@@ -1712,13 +1733,15 @@ class TicketTopicButton(discord.ui.Button):
 
 def ticket_panel_embed() -> discord.Embed:
     return brand_embed(
-        "\N{ADMISSION TICKETS} Support",
+        "\N{ADMISSION TICKETS}  Support",
+        f"** **\n{'▬' * 14}\n"
         "Need a hand? Pick the topic that fits and we'll open a private ticket for you.\n\n"
         "\N{KEY} **Key Support** — key not working or machine-locked\n"
         "\N{VIDEO GAME} **Macro Support** — help with the macro itself\n"
         "\N{SPEECH BALLOON} **Other** — anything else\n\n"
         "You'll be asked for your **license key** so we can check it's legit. "
         "One open ticket at a time.",
+        author_sub="SUPPORT",
     )
 
 
@@ -1737,17 +1760,19 @@ async def send_welcome(member: discord.Member):
     channel = bot.get_channel(wid) if wid else None
     if channel:
         try:
-            e = brand_embed(f"Welcome, {member.display_name}!",
-                            format_welcome(get_setting("welcome_message"), member))
-            e.set_thumbnail(url=member.display_avatar.url)
+            e = brand_embed(f"👋  Welcome, {member.display_name}!",
+                            format_welcome(get_setting("welcome_message"), member),
+                            color=0x57F287, author_sub="NEW MEMBER",
+                            thumb=member.display_avatar.url)
             await channel.send(content=member.mention, embed=e)
         except discord.HTTPException:
             pass
     if get_setting("welcome_dm") == "1":
         try:
             await member.send(embed=brand_embed(
-                f"Welcome to {member.guild.name}!",
-                format_welcome(get_setting("welcome_message"), member)))
+                f"👋  Welcome to {member.guild.name}!",
+                format_welcome(get_setting("welcome_message"), member),
+                color=0x57F287, author_sub="NEW MEMBER"))
         except discord.HTTPException:
             pass
 
@@ -1832,8 +1857,9 @@ async def save_ticket_transcript(channel):
     log_id = resolve_log_channel_id("ticket_close")
     ch = bot.get_channel(log_id) if log_id else None
     if ch:
-        e = brand_embed("Ticket Transcript",
-                        f"Transcript for **{getattr(channel, 'name', channel.id)}**.")
+        e = brand_embed("📕  Ticket Transcript",
+                        f"** **\n{'▬' * 14}\nTranscript for **{getattr(channel, 'name', channel.id)}**.",
+                        color=0xFEE75C, author_sub="SUPPORT")
         try:
             await ch.send(embed=e, file=discord.File(io.BytesIO(text.encode()),
                                                      filename=f"{getattr(channel,'name','ticket')}.txt"))
@@ -1938,17 +1964,19 @@ async def create_ticket(interaction: discord.Interaction, invoice_id: str, issue
     prod = get_product(purchase.get("product") or "")
     product_label = (prod or {}).get("display_name") or purchase.get("product") or "—"
     embed = brand_embed(
-        f"Ticket #{number:04d} — {topic}",
-        f"Thanks {opener.mention} — a staff member will be with you shortly.",
+        f"🎫  Ticket #{number:04d} — {topic}",
+        f"** **\n{'▬' * 14}\nThanks {opener.mention} — a staff member will be with you shortly.",
+        author_sub="SUPPORT",
+        thumb=getattr(getattr(opener, "display_avatar", None), "url", None),
     )
-    embed.add_field(name="Topic", value=topic, inline=True)
-    embed.add_field(name="Product", value=product_label, inline=True)
+    embed.add_field(name="🗂️ Topic", value=topic, inline=True)
+    embed.add_field(name="📦 Product", value=product_label, inline=True)
     if key_line:
-        embed.add_field(name="License Key", value=key_line, inline=False)
+        embed.add_field(name="🔑 License Key", value=key_line, inline=False)
     if invoice_line:
-        embed.add_field(name="Invoice", value=invoice_line, inline=False)
+        embed.add_field(name="🧾 Invoice", value=invoice_line, inline=False)
     if issue.strip():
-        embed.add_field(name="Issue", value=issue[:1024], inline=False)
+        embed.add_field(name="📝 Issue", value=issue[:1024], inline=False)
 
     ping = opener.mention + (f" {staff_role.mention}" if staff_role else "")
     await channel.send(content=ping, embed=embed, view=TicketControls())
