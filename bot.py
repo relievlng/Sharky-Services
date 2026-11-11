@@ -165,6 +165,8 @@ LOG_META = {
 }
 
 # Which saved log channel each event goes to. Missing -> general feed.
+# Granular feeds — each falls back to a broader one (LOG_FALLBACK) then the
+# general feed, so servers set up before the split still log everything.
 LOG_ROUTES = {
     # shop / purchase feed
     "key_generated": "log_shop", "delivered": "log_shop", "delivered_link": "log_shop",
@@ -173,11 +175,26 @@ LOG_ROUTES = {
     # license-key feed
     "verify_ok": "log_key", "verify_fail": "log_key", "key_revoked": "log_key",
     "key_unrevoked": "log_key", "hwid_reset": "log_key",
-    # server feed
-    "member_join": "log_server", "member_leave": "log_server", "member_ban": "log_server",
-    "member_unban": "log_server", "msg_delete": "log_server", "msg_edit": "log_server",
+    # ticket feed
+    "ticket_open": "log_ticket", "ticket_claim": "log_ticket", "ticket_close": "log_ticket",
+    # join / leave feed
+    "member_join": "log_join", "member_leave": "log_join",
+    # moderation feed
+    "member_ban": "log_mod", "member_unban": "log_mod",
+    "automod": "log_mod", "mod_action": "log_mod", "warn": "log_mod",
+    # message feed
+    "msg_delete": "log_message", "msg_edit": "log_message",
+    # server/structure feed
     "role_change": "log_server", "channel_change": "log_server", "nick_change": "log_server",
-    "automod": "log_server", "mod_action": "log_server", "warn": "log_server",
+    "linked": "log_server", "log_setup": "log_server",
+}
+
+# A specific feed falls back to a broader one if its channel wasn't created.
+LOG_FALLBACK = {
+    "log_join":    "log_server",
+    "log_mod":     "log_server",
+    "log_message": "log_server",
+    "log_ticket":  "log_shop",
 }
 
 # ===================== Logging =====================
@@ -627,10 +644,11 @@ def resolve_log_channel_id(event: str = None):
     else the general feed (/setup logs), else the LOG_CHANNEL_ID env var.
     """
     route_key = LOG_ROUTES.get(event) if event else None
-    if route_key:
+    while route_key:
         cid = _as_int(get_setting(route_key))
         if cid:
             return cid
+        route_key = LOG_FALLBACK.get(route_key)
     cid = _as_int(get_setting("log_channel_id"))
     if cid:
         return cid
@@ -703,6 +721,21 @@ def brand_embed(title: str, description: str = None, color: int = None,
 def deny_embed(msg: str = "You don't have permission to use this.") -> discord.Embed:
     """A branded red 'access denied' embed for staff-gated commands."""
     return brand_embed("⛔  Access Denied", msg, color=0xED4245, author_sub="STAFF ONLY")
+
+
+def ok_embed(title: str, msg: str = None, sub: str = "DONE") -> discord.Embed:
+    """A branded green success embed for command confirmations."""
+    return brand_embed(f"✅  {title}", msg, color=0x57F287, author_sub=sub)
+
+
+def err_embed(title: str, msg: str = None, sub: str = "ERROR") -> discord.Embed:
+    """A branded red failure embed for command errors."""
+    return brand_embed(f"⚠️  {title}", msg, color=0xED4245, author_sub=sub)
+
+
+def info_embed(title: str, msg: str = None, sub: str = "INFO") -> discord.Embed:
+    """A branded neutral info embed."""
+    return brand_embed(f"ℹ️  {title}", msg, author_sub=sub)
 
 
 def next_ticket_number() -> int:
@@ -1088,18 +1121,23 @@ async def deliver_cmd(interaction: discord.Interaction, member: discord.Member, 
         await interaction.response.send_message(embed=deny_embed(), ephemeral=True); return
     if get_product(product) is None:
         await interaction.response.send_message(
-            f"No product named `{product}`. Add it with `/product add`.", ephemeral=True)
+            embed=err_embed("Unknown Product", f"No product named `{product}`. Add it with `/product add`."),
+            ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
     ok, result = await deliver(member, product, source="manual")
     if ok:
-        await interaction.followup.send(
-            f"Delivered **{product}** to {member.mention}. Key: `{result}`", ephemeral=True)
+        e = ok_embed("Delivered", f"Sent **{product}** to {member.mention}.", sub="DELIVERY")
+        e.add_field(name="🔑 Key", value=f"```{result}```", inline=False)
+        await interaction.followup.send(embed=e, ephemeral=True)
     elif result == "closed_dms":
         await interaction.followup.send(
-            f"{member.mention} has DMs closed and couldn't be reached. Key + invoice saved.", ephemeral=True)
+            embed=err_embed("DMs Closed",
+                            f"{member.mention} has DMs closed — key + invoice saved, deliver again when open.",
+                            sub="DELIVERY"), ephemeral=True)
     else:
-        await interaction.followup.send(f"Failed: {result}", ephemeral=True)
+        await interaction.followup.send(embed=err_embed("Delivery Failed", f"`{result}`", sub="DELIVERY"),
+                                        ephemeral=True)
 
 
 # ---- Slash command: stats ----
@@ -1139,25 +1177,75 @@ async def stats(interaction: discord.Interaction):
 setup_group = app_commands.Group(name="setup", description="Bot setup commands (staff only).")
 
 
-@setup_group.command(name="logs", description="Use the current channel for the bot's log feed.")
+# The full log suite: setting key -> channel name. Shared by /setup all + /setup logs.
+LOG_FEED_DEFS = [
+    ("log_shop",       "🛒┃shop-logs"),
+    ("log_key",        "🔑┃key-logs"),
+    ("log_ticket",     "🎫┃ticket-logs"),
+    ("log_join",       "📥┃join-leave"),
+    ("log_mod",        "🛡️┃mod-logs"),
+    ("log_message",    "💬┃message-logs"),
+    ("log_server",     "📡┃server-logs"),
+    ("log_channel_id", "🤖┃bot-logs"),
+]
+
+
+async def build_log_suite(guild, staff_view):
+    """Create the Sharky Logs category and every log channel; returns created channels."""
+    logs_cat = await guild.create_category("\N{CLIPBOARD} Sharky Logs", overwrites=staff_view)
+    made = []
+    for setting_key, name in LOG_FEED_DEFS:
+        ch = await guild.create_text_channel(name, category=logs_cat, overwrites=staff_view)
+        set_setting(setting_key, str(ch.id))
+        made.append(ch)
+    return made
+
+
+@setup_group.command(name="logs",
+                     description="Create the full log suite: shop, key, ticket, join, mod, message, server, bot.")
 async def setup_logs(interaction: discord.Interaction):
     if not is_staff(interaction):
         await interaction.response.send_message(embed=deny_embed(), ephemeral=True)
         return
-    channel = interaction.channel
-    if channel is None:
+    guild = interaction.guild
+    if guild is None or not guild.me.guild_permissions.manage_channels:
         await interaction.response.send_message(
-            "Run this inside the text channel you want logs in.", ephemeral=True)
+            "I need the **Manage Channels** permission to create the log channels.", ephemeral=True)
         return
-    set_setting("log_channel_id", str(channel.id))
-    await interaction.response.send_message(
-        f"Done. Logs will now post in {channel.mention}. "
-        f"This overrides the LOG_CHANNEL_ID variable, so you don't need to set it.",
-        ephemeral=True)
-    # Post a confirmation entry into the newly chosen channel as a live test.
-    await log_event("log_setup",
-                    detail=f"Log channel set to #{getattr(channel, 'name', channel.id)} "
-                           f"by {interaction.user}")
+    await interaction.response.defer(ephemeral=True)
+
+    staff_role = resolve_staff_role(guild)
+    staff_view = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+    }
+    if staff_role:
+        staff_view[staff_role] = discord.PermissionOverwrite(view_channel=True)
+
+    try:
+        made = await build_log_suite(guild, staff_view)
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I ran out of permissions partway through. Give me **Manage Channels** and retry.",
+            ephemeral=True)
+        return
+    except discord.HTTPException as e:
+        await interaction.followup.send(embed=err_embed("Setup Error", f"`{e}`", sub="SETUP"), ephemeral=True)
+        return
+
+    e = brand_embed(
+        "📋  Log Suite Created",
+        f"** **\n{'▬' * 14}\nBuilt **{len(made)}** dedicated log channels under **Sharky Logs**.",
+        color=0x57F287, author_sub="SETUP")
+    e.add_field(name="📂 Channels", value=" ".join(c.mention for c in made), inline=False)
+    e.add_field(name="🛒 Shop",    value="purchases, deliveries, keys issued", inline=True)
+    e.add_field(name="🔑 Keys",    value="verifies, revokes, HWID resets", inline=True)
+    e.add_field(name="🎫 Tickets", value="opens, claims, transcripts", inline=True)
+    e.add_field(name="📥 Join/Leave", value="members in and out", inline=True)
+    e.add_field(name="🛡️ Mod",    value="bans, warns, automod", inline=True)
+    e.add_field(name="💬 Messages", value="edits, deletes", inline=True)
+    await interaction.followup.send(embed=e, ephemeral=True)
+    await log_event("log_setup", detail=f"Full log suite created by {interaction.user}")
 
 
 @setup_group.command(name="status", description="Show what's configured and what's still missing.")
@@ -1174,10 +1262,14 @@ async def setup_status(interaction: discord.Interaction):
     staff_rid = _as_int(get_setting("staff_role_id"))
     lines = [
         f"**Staff role:** {'<@&' + str(staff_rid) + '>' if staff_rid else 'role named ' + ADMIN_ROLE}",
-        feed("log_server", "Server logs"),
-        feed("log_key", "Key logs"),
-        feed("log_shop", "Shop logs"),
-        feed("log_channel_id", "General logs"),
+        feed("log_shop", "🛒 Shop logs"),
+        feed("log_key", "🔑 Key logs"),
+        feed("log_ticket", "🎫 Ticket logs"),
+        feed("log_join", "📥 Join/Leave logs"),
+        feed("log_mod", "🛡️ Mod logs"),
+        feed("log_message", "💬 Message logs"),
+        feed("log_server", "📡 Server logs"),
+        feed("log_channel_id", "🤖 General logs"),
         f"**Ticket category:** {'set' if cat_id else 'not set'}",
         f"**Products:** {len(list_products())} added",
         f"**OAuth login:** {'configured' if OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET else 'not set'}",
@@ -1197,11 +1289,13 @@ async def setup_all(interaction: discord.Interaction):
         return
     guild = interaction.guild
     if guild is None:
-        await interaction.response.send_message("Run this in a server.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=err_embed("Server Only", "Run this inside a server.", sub="SETUP"), ephemeral=True)
         return
     if not guild.me.guild_permissions.manage_channels:
         await interaction.response.send_message(
-            "I need the **Manage Channels** permission first, then run this again.", ephemeral=True)
+            embed=err_embed("Missing Permission", "I need **Manage Channels** first, then run this again.",
+                            sub="SETUP"), ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
 
@@ -1215,16 +1309,7 @@ async def setup_all(interaction: discord.Interaction):
 
     created = []
     try:
-        logs_cat = await guild.create_category("\N{CLIPBOARD} Sharky Logs", overwrites=staff_view)
-        feeds = {
-            "log_server": await guild.create_text_channel("server-logs", category=logs_cat, overwrites=staff_view),
-            "log_key":    await guild.create_text_channel("key-logs", category=logs_cat, overwrites=staff_view),
-            "log_shop":   await guild.create_text_channel("shop-logs", category=logs_cat, overwrites=staff_view),
-            "log_channel_id": await guild.create_text_channel("bot-logs", category=logs_cat, overwrites=staff_view),
-        }
-        for setting_key, ch in feeds.items():
-            set_setting(setting_key, str(ch.id))
-            created.append(ch)
+        created.extend(await build_log_suite(guild, staff_view))
 
         tickets_cat = await guild.create_category("\N{ADMISSION TICKETS} Tickets")
         set_setting("ticket_category", str(tickets_cat.id))
@@ -1237,18 +1322,19 @@ async def setup_all(interaction: discord.Interaction):
         created.append(support_ch)
     except discord.Forbidden:
         await interaction.followup.send(
-            "I ran out of permissions partway through. Make sure I have **Manage Channels** "
-            "and try again.", ephemeral=True)
+            embed=err_embed("Out of Permissions", "Give me **Manage Channels** and run `/setup all` again.",
+                            sub="SETUP"), ephemeral=True)
         return
     except discord.HTTPException as e:
-        await interaction.followup.send(f"Something went wrong creating channels: {e}", ephemeral=True)
+        await interaction.followup.send(embed=err_embed("Setup Error", f"`{e}`", sub="SETUP"), ephemeral=True)
         return
 
-    body = "\n".join(f"• {c.mention}" for c in created)
-    await interaction.followup.send(
-        f"**Setup complete!** Everything's wired automatically:\n{body}\n\n"
-        f"Server, key, and shop logs now route to their own channels. "
-        f"Next: add products with `/product add`.", ephemeral=True)
+    e = ok_embed("Setup Complete", "Everything's wired automatically. 🦈", sub="SETUP")
+    e.add_field(name="📂 Channels created", value=" ".join(c.mention for c in created), inline=False)
+    e.add_field(name="🎫 Tickets", value="Support panel is live", inline=True)
+    e.add_field(name="📋 Logs", value="7 feeds + bot log", inline=True)
+    e.add_field(name="➡️ Next", value="Add products with `/product add`", inline=False)
+    await interaction.followup.send(embed=e, ephemeral=True)
     await log_event("log_setup", user=interaction.user, detail="ran /setup all")
 
 
@@ -1261,7 +1347,8 @@ async def setup_staffrole(interaction: discord.Interaction, role: discord.Role):
         return
     set_setting("staff_role_id", str(role.id))
     await interaction.response.send_message(
-        f"Staff role set to {role.mention}. They'll be added to new tickets and pinged when one opens.",
+        embed=ok_embed("Staff Role Set",
+                       f"{role.mention} will be added to new tickets and pinged when one opens.", sub="CONFIG"),
         ephemeral=True)
 
 
@@ -1287,7 +1374,8 @@ async def setup_automod(interaction: discord.Interaction, invites: bool = None,
         return
     note = "" if SERVER_LOGS else ("\n\N{WARNING SIGN} Invite/spam filters need message content: set "
                                    "`SERVER_LOGS=1` and enable the **Message Content Intent**.")
-    await interaction.response.send_message("Automod updated: " + ", ".join(changed) + note, ephemeral=True)
+    await interaction.response.send_message(
+        embed=ok_embed("AutoMod Updated", ", ".join(changed) + note, sub="MOD"), ephemeral=True)
 
 
 @setup_group.command(name="welcome", description="Set the welcome channel and message for new members.")
@@ -1306,7 +1394,9 @@ async def setup_welcome(interaction: discord.Interaction, channel: discord.TextC
     note = "" if SERVER_LOGS else ("\n\N{WARNING SIGN} Set `SERVER_LOGS=1` and enable the "
                                    "**Server Members Intent** so the bot sees joins.")
     await interaction.response.send_message(
-        f"Welcomes will post in {channel.mention}{' and DM new members' if also_dm else ''}.{note}",
+        embed=ok_embed("Welcome Set",
+                       f"Welcomes will post in {channel.mention}"
+                       f"{' and DM new members' if also_dm else ''}.{note}", sub="WELCOME"),
         ephemeral=True)
 
 
@@ -1318,7 +1408,9 @@ async def setup_verify(interaction: discord.Interaction, role: discord.Role):
         return
     if role >= interaction.guild.me.top_role:
         await interaction.response.send_message(
-            "That role is above my highest role, so I can't assign it. Move my bot role above it first.",
+            embed=err_embed("Role Too High",
+                            "That role is above my highest role, so I can't assign it. "
+                            "Move my bot role above it first.", sub="VERIFY"),
             ephemeral=True)
         return
     set_setting("verified_role_id", str(role.id))
@@ -1332,7 +1424,8 @@ async def setup_verify(interaction: discord.Interaction, role: discord.Role):
     embed.add_field(name="🔓 Unlocks", value="Full server access", inline=True)
     await interaction.channel.send(embed=embed, view=VerifyView())
     await interaction.response.send_message(
-        f"Verification panel posted. Verified members get {role.mention}.", ephemeral=True)
+        embed=ok_embed("Panel Posted", f"Verified members will get {role.mention}.", sub="VERIFY"),
+        ephemeral=True)
 
 
 @setup_group.command(name="tickets", description="Post the support ticket panel in this channel.")
@@ -1341,7 +1434,9 @@ async def setup_tickets(interaction: discord.Interaction):
         await interaction.response.send_message(embed=deny_embed(), ephemeral=True)
         return
     await interaction.channel.send(embed=ticket_panel_embed(), view=TicketLauncher())
-    await interaction.response.send_message("Ticket panel posted.", ephemeral=True)
+    await interaction.response.send_message(
+        embed=ok_embed("Panel Posted", "The support ticket panel is live in this channel.", sub="SUPPORT"),
+        ephemeral=True)
 
 
 bot.tree.add_command(setup_group)
@@ -1367,13 +1462,14 @@ async def product_add(interaction: discord.Interaction, name: str, file: discord
     try:
         await file.save(PRODUCTS_DIR / safe_name)
     except Exception as e:
-        await interaction.followup.send(f"Couldn't save the file: {e}", ephemeral=True)
+        await interaction.followup.send(embed=err_embed("Save Failed", f"`{e}`", sub="CATALOG"), ephemeral=True)
         return
     add_product(slug, display_name or name, safe_name, price_id)
-    await interaction.followup.send(
-        f"Added **{display_name or name}** as `{slug}` ({file.filename}, "
-        f"{file.size // 1024} KB).\nUse this name in `/deliver` and as `product` in Stripe metadata.",
-        ephemeral=True)
+    e = ok_embed("Product Added", f"**{display_name or name}** is live in the catalog.", sub="CATALOG")
+    e.add_field(name="🏷️ Name", value=f"`{slug}`", inline=True)
+    e.add_field(name="📁 File", value=f"{file.filename} · {file.size // 1024} KB", inline=True)
+    e.add_field(name="💡 Use", value="This name in `/deliver` and as `product` in Stripe metadata.", inline=False)
+    await interaction.followup.send(embed=e, ephemeral=True)
 
 
 @product_group.command(name="remove", description="Remove a product.")
@@ -1390,7 +1486,9 @@ async def product_remove(interaction: discord.Interaction, name: str):
             pass
     ok = remove_product(name)
     await interaction.response.send_message(
-        f"Removed `{name}`." if ok else f"No product named `{name}`.", ephemeral=True)
+        embed=(ok_embed("Product Removed", f"`{name}` is gone from the catalog.", sub="CATALOG") if ok
+               else err_embed("Not Found", f"No product named `{name}`.", sub="CATALOG")),
+        ephemeral=True)
 
 
 @product_group.command(name="list", description="List all products.")
@@ -1401,7 +1499,7 @@ async def product_list(interaction: discord.Interaction):
     prods = list_products()
     if not prods:
         await interaction.response.send_message(
-            "No products yet. Add one with `/product add`.", ephemeral=True)
+            embed=info_embed("No Products", "Add one with `/product add`.", sub="CATALOG"), ephemeral=True)
         return
     lines = []
     for p in prods:
@@ -1437,20 +1535,26 @@ async def plan_add(interaction: discord.Interaction, key: str, product: str,
         return
     plan_key = slugify_plan(key)
     if not plan_key:
-        await interaction.response.send_message("Give the plan a simple key like `day`.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=err_embed("Bad Key", "Give the plan a simple key like `day`.", sub="PRICING"), ephemeral=True)
         return
     if get_product(product) is None:
         await interaction.response.send_message(
-            f"No product named `{product}`. Add it with `/product add` first.", ephemeral=True)
+            embed=err_embed("Unknown Product", f"No product named `{product}`. Add it with `/product add` first.",
+                            sub="PRICING"), ephemeral=True)
         return
     if not payment_link.startswith("https://"):
-        await interaction.response.send_message("The payment link should be a full https URL.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=err_embed("Bad Link", "The payment link should be a full https URL.", sub="PRICING"),
+            ephemeral=True)
         return
     add_plan(plan_key, product, duration.value, payment_link, label)
     base = PUBLIC_BASE_URL.rstrip("/") if PUBLIC_BASE_URL else ""
-    await interaction.response.send_message(
-        f"Added plan **{label or plan_key}** (`{plan_key}`): {duration.value} of **{product}**.\n"
-        f"Link your buy button to `{base}/buy?plan={plan_key}`.", ephemeral=True)
+    e = ok_embed("Plan Added", f"**{label or plan_key}** is live.", sub="PRICING")
+    e.add_field(name="🏷️ Key", value=f"`{plan_key}`", inline=True)
+    e.add_field(name="⏳ Duration", value=f"{duration.value} of **{product}**", inline=True)
+    e.add_field(name="🔗 Buy button", value=f"`{base}/buy?plan={plan_key}`", inline=False)
+    await interaction.response.send_message(embed=e, ephemeral=True)
 
 
 @plan_group.command(name="list", description="List all purchase plans.")
@@ -1460,7 +1564,8 @@ async def plan_list(interaction: discord.Interaction):
         return
     plans = list_plans()
     if not plans:
-        await interaction.response.send_message("No plans yet. Add one with `/plan add`.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=info_embed("No Plans", "Add one with `/plan add`.", sub="PRICING"), ephemeral=True)
         return
     lines = [f"**{p['label'] or p['plan_key']}** (`{p['plan_key']}`) — {p['duration']} of `{p['product']}`"
              for p in plans]
@@ -1476,7 +1581,9 @@ async def plan_remove(interaction: discord.Interaction, key: str):
         return
     ok = remove_plan(slugify_plan(key))
     await interaction.response.send_message(
-        f"Removed plan `{key}`." if ok else f"No plan named `{key}`.", ephemeral=True)
+        embed=(ok_embed("Plan Removed", f"`{key}` is gone.", sub="PRICING") if ok
+               else err_embed("Not Found", f"No plan named `{key}`.", sub="PRICING")),
+        ephemeral=True)
 
 
 bot.tree.add_command(plan_group)
@@ -1528,7 +1635,8 @@ async def key_lookup(interaction: discord.Interaction, key: str):
         return
     row = get_key(key.strip())
     if not row:
-        await interaction.response.send_message("No such key.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=err_embed("No Such Key", f"`{key}` isn't in the database.", sub="LICENSE"), ephemeral=True)
         return
     owner = f"<@{row['discord_id']}>" if row.get("discord_id") else "unbound"
     e = brand_embed("🔍  Key Lookup", author_sub="LICENSE")
@@ -1550,7 +1658,9 @@ async def key_revoke(interaction: discord.Interaction, key: str):
     if ok:
         await log_event("key_revoked", user=interaction.user, key=key.strip())
     await interaction.response.send_message(
-        f"Revoked `{key}`." if ok else "No such key.", ephemeral=True)
+        embed=(ok_embed("Key Revoked", f"`{key}` will no longer validate.", sub="LICENSE") if ok
+               else err_embed("No Such Key", f"`{key}` isn't in the database.", sub="LICENSE")),
+        ephemeral=True)
 
 
 @key_group.command(name="unrevoke", description="Re-enable a revoked key.")
@@ -1562,7 +1672,9 @@ async def key_unrevoke(interaction: discord.Interaction, key: str):
     if ok:
         await log_event("key_unrevoked", user=interaction.user, key=key.strip())
     await interaction.response.send_message(
-        f"Re-enabled `{key}`." if ok else "No such key.", ephemeral=True)
+        embed=(ok_embed("Key Restored", f"`{key}` validates again.", sub="LICENSE") if ok
+               else err_embed("No Such Key", f"`{key}` isn't in the database.", sub="LICENSE")),
+        ephemeral=True)
 
 
 @key_group.command(name="resethwid", description="Clear a key's machine lock so it can be used on a new PC.")
@@ -1574,7 +1686,9 @@ async def key_resethwid(interaction: discord.Interaction, key: str):
     if ok:
         await log_event("hwid_reset", user=interaction.user, key=key.strip())
     await interaction.response.send_message(
-        f"Reset the machine lock on `{key}`." if ok else "No such key.", ephemeral=True)
+        embed=(ok_embed("HWID Reset", f"`{key}` can now bind to a new machine.", sub="LICENSE") if ok
+               else err_embed("No Such Key", f"`{key}` isn't in the database.", sub="LICENSE")),
+        ephemeral=True)
 
 
 @key_group.command(name="resend", description="Re-send a key and its file to the buyer's DMs.")
@@ -1584,20 +1698,25 @@ async def key_resend(interaction: discord.Interaction, key: str):
         return
     row = get_key(key.strip())
     if not row:
-        await interaction.response.send_message("No such key.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=err_embed("No Such Key", f"`{key}` isn't in the database.", sub="LICENSE"), ephemeral=True)
         return
     if not row.get("discord_id"):
-        await interaction.response.send_message("That key isn't bound to a user.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=err_embed("Unbound Key", "That key isn't bound to a user.", sub="LICENSE"), ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
     try:
         user = await bot.fetch_user(int(row["discord_id"]))
     except discord.HTTPException:
-        await interaction.followup.send("Couldn't find that user.", ephemeral=True)
+        await interaction.followup.send(
+            embed=err_embed("User Not Found", "Couldn't fetch that user.", sub="LICENSE"), ephemeral=True)
         return
     ok, reason = await send_existing_key(user, row)
     await interaction.followup.send(
-        f"Re-sent to {user.mention}." if ok else f"Couldn't send: {reason}", ephemeral=True)
+        embed=(ok_embed("Key Re-sent", f"Delivered to {user.mention}'s DMs.", sub="LICENSE") if ok
+               else err_embed("Send Failed", f"`{reason}`", sub="LICENSE")),
+        ephemeral=True)
 
 
 @key_group.command(name="generate", description="Generate a key for a product, bound to a member.")
@@ -1612,7 +1731,8 @@ async def key_generate(interaction: discord.Interaction, member: discord.Member,
         return
     if get_product(product) is None:
         await interaction.response.send_message(
-            f"No product named `{product}`. Add it with `/product add`.", ephemeral=True)
+            embed=err_embed("Unknown Product", f"No product named `{product}`. Add it with `/product add`.",
+                            sub="LICENSE"), ephemeral=True)
         return
     dur = duration.value if duration else "lifetime"
     await interaction.response.defer(ephemeral=True)
@@ -1622,14 +1742,20 @@ async def key_generate(interaction: discord.Interaction, member: discord.Member,
     record_purchase(invoice_id, member.id, product, key, "admin")
     await log_event("key_generated", user=member, product=product, key=key,
                     detail=f"admin-issued by {interaction.user} • invoice {invoice_id} • {dur}")
-    sent = ""
+    dm_line = None
     if dm:
         ok, reason = await send_existing_key(member, get_key(key))
-        sent = "\n\N{WHITE HEAVY CHECK MARK} DMed to them." if ok else f"\n\N{WARNING SIGN} DM failed: {reason}"
+        dm_line = "✅ DMed to them." if ok else f"⚠️ DM failed: {reason}"
     plan = "Lifetime" if dur == "lifetime" else f"1 {dur}"
-    await interaction.followup.send(
-        f"Generated a **{product}** key ({plan}) bound to {member.mention}:\n`{key}`\n"
-        f"Invoice: `{invoice_id}`{sent}", ephemeral=True)
+    e = ok_embed("Key Generated", f"Bound to {member.mention}.", sub="LICENSE")
+    e.set_thumbnail(url=member.display_avatar.url)
+    e.add_field(name="📦 Product", value=product, inline=True)
+    e.add_field(name="⏳ Plan", value=plan, inline=True)
+    e.add_field(name="🧾 Invoice", value=f"`{invoice_id}`", inline=True)
+    e.add_field(name="🔑 Key", value=f"```{key}```", inline=False)
+    if dm_line:
+        e.add_field(name="📨 Delivery", value=dm_line, inline=False)
+    await interaction.followup.send(embed=e, ephemeral=True)
 
 
 bot.tree.add_command(key_group)
@@ -1643,7 +1769,8 @@ async def keys_cmd(interaction: discord.Interaction, member: discord.Member):
         return
     rows = keys_for_user(member.id)
     if not rows:
-        await interaction.response.send_message(f"{member.mention} has no keys.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=info_embed("No Keys", f"{member.mention} has no keys on record.", sub="LICENSE"), ephemeral=True)
         return
     lines = []
     for r in rows:
@@ -1817,11 +1944,13 @@ class VerifyView(discord.ui.View):
         role = interaction.guild.get_role(rid) if rid else None
         if role is None:
             await interaction.response.send_message(
-                "Verification isn't set up yet. Ask an admin to run `/setup verify`.", ephemeral=True)
+                embed=err_embed("Not Set Up", "Verification isn't configured. Ask an admin to run `/setup verify`.",
+                                sub="GATE"), ephemeral=True)
             return
         if role in interaction.user.roles:
-            await interaction.response.send_message("You're already verified. \N{WHITE HEAVY CHECK MARK}",
-                                                    ephemeral=True)
+            await interaction.response.send_message(
+                embed=info_embed("Already Verified", "You're already in — no need to verify again. 🦈", sub="GATE"),
+                ephemeral=True)
             return
         try:
             await interaction.user.add_roles(role, reason="Verified via button")
@@ -1832,8 +1961,9 @@ class VerifyView(discord.ui.View):
                 ephemeral=True)
         except discord.Forbidden:
             await interaction.response.send_message(
-                "I couldn't add the role. My role needs to be **above** the verified role and have "
-                "**Manage Roles**.", ephemeral=True)
+                embed=err_embed("Missing Permission",
+                                "I couldn't add the role. My role needs to be **above** the verified role "
+                                "and have **Manage Roles**.", sub="GATE"), ephemeral=True)
 
 
 class TicketControls(discord.ui.View):
@@ -1844,13 +1974,16 @@ class TicketControls(discord.ui.View):
                        emoji="\N{RAISED HAND}", custom_id="sharky_claim_ticket")
     async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not is_staff(interaction):
-            await interaction.response.send_message("Only staff can claim tickets.", ephemeral=True)
+            await interaction.response.send_message(
+                embed=deny_embed("Only staff can claim tickets."), ephemeral=True)
             return
         set_ticket_claimed(interaction.channel.id, interaction.user.id)
         await log_event("ticket_claim", user=interaction.user,
                         detail=f"#{getattr(interaction.channel, 'name', '')}")
         await interaction.response.send_message(
-            f"\N{RAISED HAND} Ticket claimed by {interaction.user.mention}.")
+            embed=brand_embed("🙋  Ticket Claimed",
+                              f"{interaction.user.mention} is handling this ticket.",
+                              color=0x5865F2, author_sub="SUPPORT"))
 
     @discord.ui.button(label="Close", style=discord.ButtonStyle.danger,
                        emoji="\N{LOCK}", custom_id="sharky_close_ticket")
@@ -1859,9 +1992,11 @@ class TicketControls(discord.ui.View):
         opener_id = ticket_opener(channel.id)
         if not (is_staff(interaction) or interaction.user.id == opener_id):
             await interaction.response.send_message(
-                "Only staff or the ticket opener can close this.", ephemeral=True)
+                embed=deny_embed("Only staff or the ticket opener can close this."), ephemeral=True)
             return
-        await interaction.response.send_message("Saving transcript and closing in 5 seconds…")
+        await interaction.response.send_message(
+            embed=brand_embed("🔒  Closing Ticket", "Saving transcript — this channel deletes in **5 seconds**.",
+                              color=0xED4245, author_sub="SUPPORT"))
         await save_ticket_transcript(channel)
         close_ticket_record(channel.id)
         await log_event("ticket_close", user=interaction.user,
@@ -1904,7 +2039,8 @@ async def create_ticket(interaction: discord.Interaction, invoice_id: str, issue
     guild = interaction.guild
     opener = interaction.user
     if guild is None:
-        await interaction.response.send_message("Tickets can only be opened in a server.", ephemeral=True)
+        await interaction.response.send_message(
+            embed=err_embed("Server Only", "Tickets can only be opened in a server.", sub="SUPPORT"), ephemeral=True)
         return
 
     # One open ticket per user.
@@ -1913,7 +2049,8 @@ async def create_ticket(interaction: discord.Interaction, invoice_id: str, issue
         ch = guild.get_channel(existing[1])
         if ch:
             await interaction.response.send_message(
-                f"You already have an open ticket: {ch.mention}", ephemeral=True)
+                embed=info_embed("Ticket Already Open", f"You already have one open: {ch.mention}", sub="SUPPORT"),
+                ephemeral=True)
             return
         close_ticket_record(existing[1])  # stale record; channel was deleted
 
@@ -1921,8 +2058,9 @@ async def create_ticket(interaction: discord.Interaction, invoice_id: str, issue
     invoice_id = (invoice_id or "").strip()
     if not license_key and not invoice_id:
         await interaction.response.send_message(
-            "Please enter your **license key** (or invoice ID) so we can verify your purchase.",
-            ephemeral=True)
+            embed=err_embed("Missing Key",
+                            "Please enter your **license key** (or invoice ID) so we can verify your purchase.",
+                            sub="SUPPORT"), ephemeral=True)
         return
 
     # Verify the license key — must be a real key, and yours.
@@ -1932,13 +2070,15 @@ async def create_ticket(interaction: discord.Interaction, invoice_id: str, issue
         kstatus, krow = check_key_for_ticket(license_key, opener.id)
         if kstatus == "not_found":
             await interaction.response.send_message(
-                "That license key isn't recognised. Check it and try again.", ephemeral=True)
+                embed=err_embed("Key Not Recognised", "That license key isn't in our system. Check it and try again.",
+                                sub="SUPPORT"), ephemeral=True)
             await log_event("verify_fail", user=opener, detail=f"ticket key not found: {license_key}")
             return
         if kstatus == "mismatch":
             await interaction.response.send_message(
-                "That key belongs to a different account — you can only open a ticket for your own key.",
-                ephemeral=True)
+                embed=err_embed("Not Your Key",
+                                "That key belongs to a different account — you can only open a ticket for your own key.",
+                                sub="SUPPORT"), ephemeral=True)
             await log_event("verify_fail", user=opener, detail=f"ticket key mismatch: {license_key}")
             return
         if kstatus == "revoked":
@@ -1955,7 +2095,8 @@ async def create_ticket(interaction: discord.Interaction, invoice_id: str, issue
         istatus, ipur = verify_invoice(invoice_id, opener.id)
         if istatus == "mismatch":
             await interaction.response.send_message(
-                "That invoice belongs to a different account.", ephemeral=True)
+                embed=err_embed("Not Your Invoice", "That invoice belongs to a different account.", sub="SUPPORT"),
+                ephemeral=True)
             return
         if istatus == "ok":
             invoice_line = f"`{invoice_id}` \N{WHITE HEAVY CHECK MARK} verified"
@@ -1987,8 +2128,8 @@ async def create_ticket(interaction: discord.Interaction, invoice_id: str, issue
         )
     except discord.Forbidden:
         await interaction.response.send_message(
-            "I don't have permission to create channels. Give me the **Manage Channels** permission.",
-            ephemeral=True)
+            embed=err_embed("Can't Create Channel", "Give me the **Manage Channels** permission and try again.",
+                            sub="SUPPORT"), ephemeral=True)
         return
 
     record_ticket(number, channel.id, opener.id, invoice_id or license_key)
@@ -2012,7 +2153,9 @@ async def create_ticket(interaction: discord.Interaction, invoice_id: str, issue
 
     ping = opener.mention + (f" {staff_role.mention}" if staff_role else "")
     await channel.send(content=ping, embed=embed, view=TicketControls())
-    await interaction.response.send_message(f"Ticket created: {channel.mention}", ephemeral=True)
+    await interaction.response.send_message(
+        embed=ok_embed("Ticket Opened", f"Head to {channel.mention} — staff will be with you shortly.",
+                       sub="SUPPORT"), ephemeral=True)
     await log_event("ticket_open", user=opener,
                     detail=f"#{channel.name} • {topic} • key={license_key or '-'}")
 
