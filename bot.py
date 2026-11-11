@@ -1415,6 +1415,17 @@ async def setup_all(interaction: discord.Interaction):
         support_ch = await guild.create_text_channel("support", category=tickets_cat, overwrites=support_view)
         await support_ch.send(embed=ticket_panel_embed(), view=TicketLauncher())
         created.append(support_ch)
+
+        # Public reviews channel — everyone reads, only the bot posts vouches.
+        reviews_view = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=False,
+                                                            add_reactions=True),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+        }
+        reviews_ch = await guild.create_text_channel("⭐┃reviews", category=tickets_cat,
+                                                     overwrites=reviews_view)
+        set_setting("vouch_channel_id", str(reviews_ch.id))
+        created.append(reviews_ch)
     except discord.Forbidden:
         await interaction.followup.send(
             embed=err_embed("Out of Permissions", "Give me **Manage Channels** and run `/setup all` again.",
@@ -1427,6 +1438,7 @@ async def setup_all(interaction: discord.Interaction):
     e = ok_embed("Setup Complete", "Everything's wired automatically. 🦈", sub="SETUP")
     e.add_field(name="📂 Channels created", value=" ".join(c.mention for c in created), inline=False)
     e.add_field(name="🎫 Tickets", value="Support panel is live", inline=True)
+    e.add_field(name="⭐ Reviews", value="Vouch channel wired", inline=True)
     e.add_field(name="📋 Logs", value="7 feeds + bot log", inline=True)
     e.add_field(name="➡️ Next", value="Add products with `/product add`", inline=False)
     await interaction.followup.send(embed=e, ephemeral=True)
