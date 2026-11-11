@@ -280,6 +280,17 @@ def db_init():
             created_at   TEXT NOT NULL
         )
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS vouches (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            discord_id  INTEGER NOT NULL,
+            username    TEXT,
+            stars       INTEGER NOT NULL,
+            comment     TEXT,
+            product     TEXT,
+            created_at  TEXT NOT NULL
+        )
+    """)
     # Migration-safe column adds for existing databases.
     existing = {r[1] for r in con.execute("PRAGMA table_info(licenses)").fetchall()}
     if "hwid" not in existing:
@@ -631,6 +642,43 @@ def set_setting(key: str, value: str):
     con.commit(); con.close()
 
 
+def user_owns_any_key(discord_id: int) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute("SELECT 1 FROM licenses WHERE discord_id = ? LIMIT 1", (discord_id,)).fetchone()
+    con.close()
+    return row is not None
+
+
+def add_vouch(discord_id: int, username: str, stars: int, comment: str, product: str = None) -> int:
+    con = sqlite3.connect(DB_PATH)
+    cur = con.execute(
+        "INSERT INTO vouches (discord_id, username, stars, comment, product, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (discord_id, username, stars, comment, product, datetime.now(timezone.utc).isoformat()))
+    con.commit()
+    vid = cur.lastrowid
+    con.close()
+    return vid
+
+
+def vouch_stats() -> tuple[int, float]:
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute("SELECT COUNT(*), AVG(stars) FROM vouches").fetchone()
+    con.close()
+    total = row[0] or 0
+    avg = round(row[1], 2) if row[1] is not None else 0.0
+    return total, avg
+
+
+def recent_vouches(limit: int = 5):
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    rows = con.execute(
+        "SELECT * FROM vouches ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+
 def _as_int(v):
     try:
         return int(v)
@@ -922,6 +970,7 @@ if SERVER_LOGS:
     intents.members = True
     intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+START_TIME = time.time()
 
 
 async def log_event(event: str, *, user=None, product=None, key=None, detail=None):
@@ -983,6 +1032,28 @@ async def log_event(event: str, *, user=None, product=None, key=None, detail=Non
         await channel.send(embed=embed)
     except discord.HTTPException as e:
         log.error("Could not post to log channel: %s", e)
+
+
+async def grant_customer_role(user_id: int):
+    """Give a buyer the configured customer role, if one is set. Best-effort."""
+    rid = _as_int(get_setting("customer_role_id"))
+    if not rid:
+        return
+    guild = bot.get_guild(GUILD_ID) if GUILD_ID else None
+    if guild is None:
+        guild = bot.guilds[0] if bot.guilds else None
+    if guild is None:
+        return
+    member = guild.get_member(user_id)
+    role = guild.get_role(rid)
+    if member is None or role is None:
+        return
+    if role in member.roles:
+        return
+    try:
+        await member.add_roles(role, reason="Verified purchase")
+    except discord.HTTPException as e:
+        log.error("Could not grant customer role: %s", e)
 
 
 async def deliver(user: discord.abc.User, product: str,
@@ -1058,6 +1129,7 @@ async def deliver(user: discord.abc.User, product: str,
         await send_to(user)
         await dlog("delivered" if not use_link else "delivered_link",
                         user=user, product=product, key=key, detail=f"invoice {invoice_id}")
+        await grant_customer_role(user.id)
         return True, key
     except discord.Forbidden:
         pass  # DMs closed — fall through to channel delivery
@@ -1093,6 +1165,7 @@ async def deliver(user: discord.abc.User, product: str,
         await send_to(channel, content=f"{member.mention} your DMs are closed, so here's your order:")
         await dlog("delivered_chan", user=user, product=product, key=key,
                         detail=f"invoice {invoice_id} in #{channel.name}")
+        await grant_customer_role(user.id)
         return True, key
     except discord.Forbidden:
         await dlog("closed_dms", user=user, product=product, key=key,
@@ -1271,6 +1344,8 @@ async def setup_status(interaction: discord.Interaction):
         feed("log_server", "📡 Server logs"),
         feed("log_channel_id", "🤖 General logs"),
         f"**Ticket category:** {'set' if cat_id else 'not set'}",
+        f"**Customer role:** {'<@&' + get_setting('customer_role_id') + '>' if get_setting('customer_role_id') else 'not set'}",
+        f"**Vouch channel:** {'<#' + get_setting('vouch_channel_id') + '>' if get_setting('vouch_channel_id') else 'not set'}",
         f"**Products:** {len(list_products())} added",
         f"**OAuth login:** {'configured' if OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET else 'not set'}",
         f"**Public URL:** {PUBLIC_BASE_URL or 'not set'}",
@@ -1349,6 +1424,38 @@ async def setup_staffrole(interaction: discord.Interaction, role: discord.Role):
     await interaction.response.send_message(
         embed=ok_embed("Staff Role Set",
                        f"{role.mention} will be added to new tickets and pinged when one opens.", sub="CONFIG"),
+        ephemeral=True)
+
+
+@setup_group.command(name="customerrole",
+                     description="Auto-grant this role to buyers when a purchase is delivered.")
+@app_commands.describe(role="The role to give verified buyers")
+async def setup_customerrole(interaction: discord.Interaction, role: discord.Role):
+    if not is_staff(interaction):
+        await interaction.response.send_message(embed=deny_embed(), ephemeral=True)
+        return
+    if role >= interaction.guild.me.top_role:
+        await interaction.response.send_message(
+            embed=err_embed("Role Too High",
+                            "That role is above mine — move my bot role above it and give me **Manage Roles**.",
+                            sub="CONFIG"), ephemeral=True)
+        return
+    set_setting("customer_role_id", str(role.id))
+    await interaction.response.send_message(
+        embed=ok_embed("Customer Role Set",
+                       f"Buyers will automatically get {role.mention} the moment their order delivers.",
+                       sub="CONFIG"), ephemeral=True)
+
+
+@setup_group.command(name="vouches", description="Set the channel where customer reviews get posted.")
+@app_commands.describe(channel="The channel for /vouch reviews")
+async def setup_vouches(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not is_staff(interaction):
+        await interaction.response.send_message(embed=deny_embed(), ephemeral=True)
+        return
+    set_setting("vouch_channel_id", str(channel.id))
+    await interaction.response.send_message(
+        embed=ok_embed("Vouch Channel Set", f"Customer reviews will post in {channel.mention}. 🦈", sub="CONFIG"),
         ephemeral=True)
 
 
@@ -1790,7 +1897,10 @@ async def help_cmd(interaction: discord.Interaction):
                     "Open a ticket for support using your invoice ID.",
                     author_sub="COMMANDS")
     e.add_field(name="Everyone",
-                value="`/help` — this menu", inline=False)
+                value="`/help` — this menu\n"
+                      "`/vouch` — leave a star rating + review (buyers only)\n"
+                      "`/vouches` — see the latest reviews\n"
+                      "`/botinfo` — live bot stats", inline=False)
     if staff:
         e.add_field(
             name="Setup (staff)",
@@ -1812,7 +1922,128 @@ async def help_cmd(interaction: discord.Interaction):
             value="`/key generate` — issue a key bound to a member\n"
                   "`/key lookup` · `/key revoke` · `/key unrevoke`\n"
                   "`/key resethwid` · `/key resend` · `/keys @user`", inline=False)
+        e.add_field(
+            name="Extras (staff)",
+            value="`/setup verify` · `/setup welcome` · `/setup automod`\n"
+                  "`/setup customerrole` — auto-role buyers on purchase\n"
+                  "`/setup vouches` — set the reviews channel\n"
+                  "`/warn` · `/warnings` — moderation", inline=False)
     await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+def star_bar(stars: int) -> str:
+    stars = max(1, min(5, int(stars)))
+    return "⭐" * stars + "▪️" * (5 - stars)
+
+
+@bot.tree.command(name="vouch", description="Leave a star rating and review (buyers only).")
+@app_commands.describe(stars="How many stars, 1 to 5", review="A few words about the product/service")
+@app_commands.choices(stars=[
+    app_commands.Choice(name="⭐⭐⭐⭐⭐ 5 — Amazing", value=5),
+    app_commands.Choice(name="⭐⭐⭐⭐ 4 — Great", value=4),
+    app_commands.Choice(name="⭐⭐⭐ 3 — Good", value=3),
+    app_commands.Choice(name="⭐⭐ 2 — Okay", value=2),
+    app_commands.Choice(name="⭐ 1 — Poor", value=1),
+])
+async def vouch_cmd(interaction: discord.Interaction, stars: app_commands.Choice[int], review: str):
+    # Only verified buyers can vouch — keeps reviews legit.
+    if not user_owns_any_key(interaction.user.id):
+        await interaction.response.send_message(
+            embed=err_embed("Buyers Only",
+                            "Only verified buyers can leave a vouch. Purchase first, then come back! 🦈",
+                            sub="VOUCH"),
+            ephemeral=True)
+        return
+    if len(review.strip()) < 3:
+        await interaction.response.send_message(
+            embed=err_embed("Too Short", "Add a few words about your experience.", sub="VOUCH"), ephemeral=True)
+        return
+
+    vid = add_vouch(interaction.user.id, str(interaction.user), stars.value, review.strip())
+    total, avg = vouch_stats()
+
+    e = brand_embed(
+        f"{star_bar(stars.value)}",
+        f"** **\n> {review.strip()}\n{'▬' * 16}",
+        color=0xFEE75C, author_sub="NEW VOUCH",
+        thumb=interaction.user.display_avatar.url)
+    e.add_field(name="👤 From", value=interaction.user.mention, inline=True)
+    e.add_field(name="⭐ Rating", value=f"**{stars.value}/5**", inline=True)
+    e.add_field(name="🦈 Vouch #", value=f"`{vid}`", inline=True)
+    e.set_footer(text=f"{BRAND_NAME} • {total} vouches • {avg}★ average",
+                 icon_url=LOGO_URL or discord.utils.MISSING)
+
+    # Post publicly to the vouch channel if configured, else just confirm.
+    vch_id = _as_int(get_setting("vouch_channel_id"))
+    posted = None
+    if vch_id:
+        ch = bot.get_channel(vch_id)
+        if ch is not None:
+            try:
+                posted = await ch.send(embed=e)
+            except discord.HTTPException:
+                posted = None
+
+    if posted:
+        await interaction.response.send_message(
+            embed=ok_embed("Thanks for the Vouch!", f"Your review is live in {posted.channel.mention}. 🦈",
+                           sub="VOUCH"),
+            ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=e, ephemeral=False)
+
+
+@bot.tree.command(name="vouches", description="See the latest reviews and the overall rating.")
+async def vouches_cmd(interaction: discord.Interaction):
+    total, avg = vouch_stats()
+    if total == 0:
+        await interaction.response.send_message(
+            embed=info_embed("No Vouches Yet", "Be the first to `/vouch`! 🦈", sub="VOUCH"), ephemeral=True)
+        return
+    rows = recent_vouches(6)
+    e = brand_embed(
+        "🦈  Customer Vouches",
+        f"** **\n**{total}** reviews · **{avg}★** average\n{'▬' * 16}",
+        color=0xFEE75C, author_sub="REVIEWS")
+    for r in rows:
+        who = f"<@{r['discord_id']}>"
+        e.add_field(
+            name=f"{star_bar(r['stars'])}  ·  {r.get('username') or 'buyer'}",
+            value=f"> {(r.get('comment') or '').strip()[:200]}\n{who}",
+            inline=False)
+    await interaction.response.send_message(embed=e)
+
+
+@bot.tree.command(name="botinfo", description="Live bot stats — uptime, ping, members, keys, vouches.")
+async def botinfo_cmd(interaction: discord.Interaction):
+    up = int(time.time() - START_TIME)
+    d, rem = divmod(up, 86400); h, rem = divmod(rem, 3600); m, _ = divmod(rem, 60)
+    uptime = (f"{d}d " if d else "") + (f"{h}h " if h else "") + f"{m}m"
+    members = sum(g.member_count or 0 for g in bot.guilds)
+    try:
+        con = sqlite3.connect(DB_PATH)
+        keys = con.execute("SELECT COUNT(*) FROM licenses").fetchone()[0]
+        linked = con.execute("SELECT COUNT(*) FROM links").fetchone()[0]
+        con.close()
+    except Exception:
+        keys = linked = 0
+    total_v, avg_v = vouch_stats()
+    ping = round(bot.latency * 1000)
+
+    e = brand_embed(
+        f"🦈  {BRAND_NAME}",
+        f"** **\nThe all-in-one delivery, support & shop bot.\n{'▬' * 16}",
+        author_sub="SYSTEM")
+    e.add_field(name="🟢 Uptime", value=f"**{uptime or '<1m'}**", inline=True)
+    e.add_field(name="📡 Ping", value=f"**{ping}ms**", inline=True)
+    e.add_field(name="🏠 Servers", value=f"**{len(bot.guilds)}**", inline=True)
+    e.add_field(name="👥 Members", value=f"**{members}**", inline=True)
+    e.add_field(name="🔑 Keys issued", value=f"**{keys}**", inline=True)
+    e.add_field(name="🔗 Linked", value=f"**{linked}**", inline=True)
+    e.add_field(name="⭐ Vouches", value=f"**{total_v}** · {avg_v}★", inline=True)
+    if interaction.client.user:
+        e.set_thumbnail(url=interaction.client.user.display_avatar.url)
+    await interaction.response.send_message(embed=e)
 
 
 # ===================== Ticket system =====================
