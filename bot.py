@@ -474,6 +474,23 @@ def invoice_for_key(key: str):
     return row[0] if row else None
 
 
+def latest_purchase(discord_id: int):
+    """Most recent product a user bought — used to tag their rating."""
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute(
+        "SELECT product FROM purchases WHERE discord_id = ? ORDER BY created_at DESC LIMIT 1",
+        (discord_id,)).fetchone()
+    con.close()
+    return row[0] if row else None
+
+
+def already_vouched(discord_id: int) -> bool:
+    con = sqlite3.connect(DB_PATH)
+    row = con.execute("SELECT 1 FROM vouches WHERE discord_id = ? LIMIT 1", (discord_id,)).fetchone()
+    con.close()
+    return row is not None
+
+
 def verify_invoice(invoice_id: str, discord_id: int):
     """
     Check an invoice entered at ticket time.
@@ -1116,13 +1133,16 @@ async def deliver(user: discord.abc.User, product: str,
                               f"Link expires in {LINK_TTL // 60} min.", inline=False)
         else:
             e.add_field(name="📁 File", value=file_path.name, inline=False)
+        e.add_field(name="⭐ Rate your purchase",
+                    value="Tap a star below to leave a quick review — it helps a ton! 🦈", inline=False)
         return e
 
     async def send_to(dest, content=None):
         if use_link:
-            await dest.send(content=content, embed=build_embed())
+            await dest.send(content=content, embed=build_embed(), view=RateView())
         else:
-            await dest.send(content=content, embed=build_embed(), file=discord.File(file_path))
+            await dest.send(content=content, embed=build_embed(), file=discord.File(file_path),
+                            view=RateView())
 
     # 1) Try the DM.
     try:
@@ -1936,6 +1956,90 @@ def star_bar(stars: int) -> str:
     return "⭐" * stars + "▪️" * (5 - stars)
 
 
+def build_vouch_embed(user, stars: int, review: str, vid: int, product: str = None) -> discord.Embed:
+    total, avg = vouch_stats()
+    e = brand_embed(
+        f"{star_bar(stars)}",
+        f"** **\n> {review.strip()}\n{'▬' * 16}",
+        color=0xFEE75C, author_sub="NEW VOUCH",
+        thumb=getattr(getattr(user, "display_avatar", None), "url", None))
+    e.add_field(name="👤 From", value=getattr(user, "mention", str(user)), inline=True)
+    e.add_field(name="⭐ Rating", value=f"**{stars}/5**", inline=True)
+    if product:
+        e.add_field(name="📦 Product", value=product, inline=True)
+    e.set_footer(text=f"{BRAND_NAME} • {total} vouches • {avg}★ average • #{vid}",
+                 icon_url=LOGO_URL or discord.utils.MISSING)
+    return e
+
+
+async def post_vouch(user, stars: int, review: str, product: str = None):
+    """Record a vouch and post it to the configured channel. Returns (embed, posted_channel)."""
+    vid = add_vouch(user.id, str(user), stars, review.strip(), product)
+    e = build_vouch_embed(user, stars, review, vid, product)
+    vch_id = _as_int(get_setting("vouch_channel_id"))
+    posted = None
+    if vch_id:
+        ch = bot.get_channel(vch_id)
+        if ch is not None:
+            try:
+                posted = await ch.send(embed=e)
+            except discord.HTTPException:
+                posted = None
+    return e, posted
+
+
+class ReviewModal(discord.ui.Modal):
+    """Asks for the written review after a buyer taps a star rating."""
+    def __init__(self, stars: int):
+        super().__init__(title=f"{stars}-Star Review")
+        self.stars = stars
+        self.review = discord.ui.TextInput(
+            label="Your review",
+            placeholder="How was the product? A few words…",
+            style=discord.TextStyle.paragraph,
+            required=True, max_length=400, min_length=3,
+        )
+        self.add_item(self.review)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        product = latest_purchase(interaction.user.id)
+        _e, posted = await post_vouch(interaction.user, self.stars, str(self.review.value), product)
+        where = f" in {posted.channel.mention}" if posted else ""
+        await interaction.response.send_message(
+            embed=ok_embed("Thanks for Rating!",
+                           f"Your **{self.stars}★** review is posted{where}. We appreciate you! 🦈",
+                           sub="VOUCH"),
+            ephemeral=True)
+
+
+class RateView(discord.ui.View):
+    """Five star buttons attached to the delivery DM so buyers rate in one tap."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _handle(self, interaction: discord.Interaction, stars: int):
+        if not user_owns_any_key(interaction.user.id):
+            await interaction.response.send_message(
+                embed=err_embed("Buyers Only", "Only verified buyers can rate.", sub="VOUCH"), ephemeral=True)
+            return
+        await interaction.response.send_modal(ReviewModal(stars))
+
+    @discord.ui.button(label="1", emoji="⭐", style=discord.ButtonStyle.secondary, custom_id="sharky_rate_1")
+    async def r1(self, i: discord.Interaction, b: discord.ui.Button): await self._handle(i, 1)
+
+    @discord.ui.button(label="2", emoji="⭐", style=discord.ButtonStyle.secondary, custom_id="sharky_rate_2")
+    async def r2(self, i: discord.Interaction, b: discord.ui.Button): await self._handle(i, 2)
+
+    @discord.ui.button(label="3", emoji="⭐", style=discord.ButtonStyle.secondary, custom_id="sharky_rate_3")
+    async def r3(self, i: discord.Interaction, b: discord.ui.Button): await self._handle(i, 3)
+
+    @discord.ui.button(label="4", emoji="⭐", style=discord.ButtonStyle.secondary, custom_id="sharky_rate_4")
+    async def r4(self, i: discord.Interaction, b: discord.ui.Button): await self._handle(i, 4)
+
+    @discord.ui.button(label="5", emoji="⭐", style=discord.ButtonStyle.success, custom_id="sharky_rate_5")
+    async def r5(self, i: discord.Interaction, b: discord.ui.Button): await self._handle(i, 5)
+
+
 @bot.tree.command(name="vouch", description="Leave a star rating and review (buyers only).")
 @app_commands.describe(stars="How many stars, 1 to 5", review="A few words about the product/service")
 @app_commands.choices(stars=[
@@ -1959,31 +2063,7 @@ async def vouch_cmd(interaction: discord.Interaction, stars: app_commands.Choice
             embed=err_embed("Too Short", "Add a few words about your experience.", sub="VOUCH"), ephemeral=True)
         return
 
-    vid = add_vouch(interaction.user.id, str(interaction.user), stars.value, review.strip())
-    total, avg = vouch_stats()
-
-    e = brand_embed(
-        f"{star_bar(stars.value)}",
-        f"** **\n> {review.strip()}\n{'▬' * 16}",
-        color=0xFEE75C, author_sub="NEW VOUCH",
-        thumb=interaction.user.display_avatar.url)
-    e.add_field(name="👤 From", value=interaction.user.mention, inline=True)
-    e.add_field(name="⭐ Rating", value=f"**{stars.value}/5**", inline=True)
-    e.add_field(name="🦈 Vouch #", value=f"`{vid}`", inline=True)
-    e.set_footer(text=f"{BRAND_NAME} • {total} vouches • {avg}★ average",
-                 icon_url=LOGO_URL or discord.utils.MISSING)
-
-    # Post publicly to the vouch channel if configured, else just confirm.
-    vch_id = _as_int(get_setting("vouch_channel_id"))
-    posted = None
-    if vch_id:
-        ch = bot.get_channel(vch_id)
-        if ch is not None:
-            try:
-                posted = await ch.send(embed=e)
-            except discord.HTTPException:
-                posted = None
-
+    e, posted = await post_vouch(interaction.user, stars.value, review, latest_purchase(interaction.user.id))
     if posted:
         await interaction.response.send_message(
             embed=ok_embed("Thanks for the Vouch!", f"Your review is live in {posted.channel.mention}. 🦈",
@@ -2743,6 +2823,7 @@ async def on_ready():
     bot.add_view(TicketLauncher())
     bot.add_view(TicketControls())
     bot.add_view(VerifyView())
+    bot.add_view(RateView())
 
     try:
         if GUILD_ID:
