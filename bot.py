@@ -1318,9 +1318,13 @@ async def setup_verify(interaction: discord.Interaction, role: discord.Role):
         return
     set_setting("verified_role_id", str(role.id))
     embed = brand_embed(
-        "\N{WHITE HEAVY CHECK MARK} Verification",
-        f"Click the button below to verify and unlock the rest of the server. "
-        f"You'll get the {role.mention} role.")
+        "\N{WHITE HEAVY CHECK MARK}  Verification",
+        f"** **\nWelcome to **{interaction.guild.name}**! 🦈\n"
+        f"Tap **Verify** below to confirm you're human and unlock the rest of the server.\n"
+        f"{'▬' * 16}",
+        color=0x57F287, author_sub="GATE")
+    embed.add_field(name="🎁 You'll receive", value=role.mention, inline=True)
+    embed.add_field(name="🔓 Unlocks", value="Full server access", inline=True)
     await interaction.channel.send(embed=embed, view=VerifyView())
     await interaction.response.send_message(
         f"Verification panel posted. Verified members get {role.mention}.", ephemeral=True)
@@ -1681,10 +1685,17 @@ async def help_cmd(interaction: discord.Interaction):
 
 # ===================== Ticket system =====================
 # Ticket topics shown as buttons on the panel.
+# custom_id -> (button label, emoji, topic name, button style, blurb)
 TICKET_TOPICS = {
-    "sharky_tkt_key":   ("Key Support", "\N{KEY}", "Key Support"),
-    "sharky_tkt_macro": ("Macro Support", "\N{VIDEO GAME}", "Macro Support"),
-    "sharky_tkt_other": ("Other", "\N{SPEECH BALLOON}", "Other"),
+    "sharky_tkt_key":   ("Key Support",   "\N{KEY}",           "Key Support",
+                         discord.ButtonStyle.primary,
+                         "Key not working, machine-locked, or needs a reset"),
+    "sharky_tkt_macro": ("Macro Support", "\N{VIDEO GAME}",    "Macro Support",
+                         discord.ButtonStyle.success,
+                         "Setup help or issues with the macro itself"),
+    "sharky_tkt_other": ("Other",         "\N{SPEECH BALLOON}", "Other",
+                         discord.ButtonStyle.secondary,
+                         "Billing, questions, or anything else"),
 }
 
 
@@ -1717,14 +1728,14 @@ class TicketModal(discord.ui.Modal):
 class TicketLauncher(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
-        for cid, (label, emoji, topic) in TICKET_TOPICS.items():
-            self.add_item(TicketTopicButton(cid, label, emoji, topic))
+        for cid, (label, emoji, topic, style, _blurb) in TICKET_TOPICS.items():
+            self.add_item(TicketTopicButton(cid, label, emoji, topic, style))
 
 
 class TicketTopicButton(discord.ui.Button):
-    def __init__(self, custom_id: str, label: str, emoji: str, topic: str):
-        super().__init__(label=label, emoji=emoji,
-                         style=discord.ButtonStyle.secondary, custom_id=custom_id)
+    def __init__(self, custom_id: str, label: str, emoji: str, topic: str,
+                 style: discord.ButtonStyle = discord.ButtonStyle.secondary):
+        super().__init__(label=label, emoji=emoji, style=style, custom_id=custom_id)
         self.topic = topic
 
     async def callback(self, interaction: discord.Interaction):
@@ -1732,17 +1743,30 @@ class TicketTopicButton(discord.ui.Button):
 
 
 def ticket_panel_embed() -> discord.Embed:
-    return brand_embed(
-        "\N{ADMISSION TICKETS}  Support",
-        f"** **\n{'▬' * 14}\n"
-        "Need a hand? Pick the topic that fits and we'll open a private ticket for you.\n\n"
-        "\N{KEY} **Key Support** — key not working or machine-locked\n"
-        "\N{VIDEO GAME} **Macro Support** — help with the macro itself\n"
-        "\N{SPEECH BALLOON} **Other** — anything else\n\n"
-        "You'll be asked for your **license key** so we can check it's legit. "
-        "One open ticket at a time.",
+    e = brand_embed(
+        "\N{ADMISSION TICKETS}  Support Center",
+        f"** **\nWelcome to **{BRAND_NAME}** support. 🦈\n"
+        "Pick the button below that matches your issue and we'll open a **private ticket** "
+        "just for you and the staff team.\n"
+        f"{'▬' * 16}",
         author_sub="SUPPORT",
     )
+    # One clean field per topic, built straight from the button table
+    for _cid, (label, emoji, _topic, _style, blurb) in TICKET_TOPICS.items():
+        e.add_field(name=f"{emoji}  {label}", value=f"> {blurb}", inline=False)
+
+    e.add_field(
+        name="📋  Before you open",
+        value=("> • Have your **license key** (`SS-…`) ready — we verify it's legit\n"
+               "> • **One** open ticket per person at a time\n"
+               "> • Be clear about the issue so staff can help fast"),
+        inline=False,
+    )
+    e.add_field(name="⏱️ Response", value="Usually within a few hours", inline=True)
+    e.add_field(name="🔒 Privacy",  value="Tickets are private to you + staff", inline=True)
+    e.set_footer(text=f"{BRAND_NAME} • Click a button below to start",
+                 icon_url=LOGO_URL or discord.utils.MISSING)
+    return e
 
 
 # ===================== Welcome + verification =====================
