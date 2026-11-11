@@ -30,7 +30,7 @@ from datetime import datetime, timezone, timedelta
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 import aiohttp
 from aiohttp import web
 
@@ -700,6 +700,11 @@ def brand_embed(title: str, description: str = None, color: int = None,
     return e
 
 
+def deny_embed(msg: str = "You don't have permission to use this.") -> discord.Embed:
+    """A branded red 'access denied' embed for staff-gated commands."""
+    return brand_embed("⛔  Access Denied", msg, color=0xED4245, author_sub="STAFF ONLY")
+
+
 def next_ticket_number() -> int:
     n = int(get_setting("ticket_counter") or "0") + 1
     set_setting("ticket_counter", str(n))
@@ -1080,7 +1085,7 @@ async def product_autocomplete(interaction: discord.Interaction, current: str):
 @app_commands.autocomplete(product=product_autocomplete)
 async def deliver_cmd(interaction: discord.Interaction, member: discord.Member, product: str):
     if not is_staff(interaction):
-        await interaction.response.send_message("You can't use this.", ephemeral=True); return
+        await interaction.response.send_message(embed=deny_embed(), ephemeral=True); return
     if get_product(product) is None:
         await interaction.response.send_message(
             f"No product named `{product}`. Add it with `/product add`.", ephemeral=True)
@@ -1101,7 +1106,7 @@ async def deliver_cmd(interaction: discord.Interaction, member: discord.Member, 
 @bot.tree.command(description="Show keys issued and deliveries per product (staff only).")
 async def stats(interaction: discord.Interaction):
     if not is_staff(interaction):
-        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        await interaction.response.send_message(embed=deny_embed(), ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
 
@@ -1137,7 +1142,7 @@ setup_group = app_commands.Group(name="setup", description="Bot setup commands (
 @setup_group.command(name="logs", description="Use the current channel for the bot's log feed.")
 async def setup_logs(interaction: discord.Interaction):
     if not is_staff(interaction):
-        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        await interaction.response.send_message(embed=deny_embed(), ephemeral=True)
         return
     channel = interaction.channel
     if channel is None:
@@ -1158,7 +1163,7 @@ async def setup_logs(interaction: discord.Interaction):
 @setup_group.command(name="status", description="Show what's configured and what's still missing.")
 async def setup_status(interaction: discord.Interaction):
     if not is_staff(interaction):
-        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        await interaction.response.send_message(embed=deny_embed(), ephemeral=True)
         return
 
     def feed(key, label):
@@ -1188,7 +1193,7 @@ async def setup_status(interaction: discord.Interaction):
                      description="One-click: create every log channel, a tickets area, and the panel.")
 async def setup_all(interaction: discord.Interaction):
     if not is_staff(interaction):
-        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        await interaction.response.send_message(embed=deny_embed(), ephemeral=True)
         return
     guild = interaction.guild
     if guild is None:
@@ -1252,7 +1257,7 @@ async def setup_all(interaction: discord.Interaction):
 @app_commands.describe(role="The role to treat as staff")
 async def setup_staffrole(interaction: discord.Interaction, role: discord.Role):
     if not is_staff(interaction):
-        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        await interaction.response.send_message(embed=deny_embed(), ephemeral=True)
         return
     set_setting("staff_role_id", str(role.id))
     await interaction.response.send_message(
@@ -1267,7 +1272,7 @@ async def setup_staffrole(interaction: discord.Interaction, role: discord.Role):
 async def setup_automod(interaction: discord.Interaction, invites: bool = None,
                         spam: bool = None, mentions: bool = None):
     if not is_staff(interaction):
-        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        await interaction.response.send_message(embed=deny_embed(), ephemeral=True)
         return
     changed = []
     for name, val in (("automod_invites", invites), ("automod_spam", spam), ("automod_mentions", mentions)):
@@ -1292,7 +1297,7 @@ async def setup_automod(interaction: discord.Interaction, invites: bool = None,
 async def setup_welcome(interaction: discord.Interaction, channel: discord.TextChannel,
                         message: str = None, also_dm: bool = False):
     if not is_staff(interaction):
-        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        await interaction.response.send_message(embed=deny_embed(), ephemeral=True)
         return
     set_setting("welcome_channel_id", str(channel.id))
     if message:
@@ -1309,7 +1314,7 @@ async def setup_welcome(interaction: discord.Interaction, channel: discord.TextC
 @app_commands.describe(role="Role to give when someone verifies")
 async def setup_verify(interaction: discord.Interaction, role: discord.Role):
     if not is_staff(interaction):
-        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        await interaction.response.send_message(embed=deny_embed(), ephemeral=True)
         return
     if role >= interaction.guild.me.top_role:
         await interaction.response.send_message(
@@ -1333,7 +1338,7 @@ async def setup_verify(interaction: discord.Interaction, role: discord.Role):
 @setup_group.command(name="tickets", description="Post the support ticket panel in this channel.")
 async def setup_tickets(interaction: discord.Interaction):
     if not is_staff(interaction):
-        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        await interaction.response.send_message(embed=deny_embed(), ephemeral=True)
         return
     await interaction.channel.send(embed=ticket_panel_embed(), view=TicketLauncher())
     await interaction.response.send_message("Ticket panel posted.", ephemeral=True)
@@ -1353,7 +1358,7 @@ product_group = app_commands.Group(name="product", description="Manage products 
 async def product_add(interaction: discord.Interaction, name: str, file: discord.Attachment,
                       display_name: str = None, price_id: str = None):
     if not is_staff(interaction):
-        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        await interaction.response.send_message(embed=deny_embed(), ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
     slug = slugify_product(name)
@@ -1375,7 +1380,7 @@ async def product_add(interaction: discord.Interaction, name: str, file: discord
 @app_commands.autocomplete(name=product_autocomplete)
 async def product_remove(interaction: discord.Interaction, name: str):
     if not is_staff(interaction):
-        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        await interaction.response.send_message(embed=deny_embed(), ephemeral=True)
         return
     prod = get_product(name)
     if prod and prod.get("filename"):
@@ -1391,7 +1396,7 @@ async def product_remove(interaction: discord.Interaction, name: str):
 @product_group.command(name="list", description="List all products.")
 async def product_list(interaction: discord.Interaction):
     if not is_staff(interaction):
-        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        await interaction.response.send_message(embed=deny_embed(), ephemeral=True)
         return
     prods = list_products()
     if not prods:
@@ -1428,7 +1433,7 @@ async def plan_autocomplete(interaction: discord.Interaction, current: str):
 async def plan_add(interaction: discord.Interaction, key: str, product: str,
                    duration: app_commands.Choice[str], payment_link: str, label: str = None):
     if not is_staff(interaction):
-        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        await interaction.response.send_message(embed=deny_embed(), ephemeral=True)
         return
     plan_key = slugify_plan(key)
     if not plan_key:
@@ -1451,7 +1456,7 @@ async def plan_add(interaction: discord.Interaction, key: str, product: str,
 @plan_group.command(name="list", description="List all purchase plans.")
 async def plan_list(interaction: discord.Interaction):
     if not is_staff(interaction):
-        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        await interaction.response.send_message(embed=deny_embed(), ephemeral=True)
         return
     plans = list_plans()
     if not plans:
@@ -1467,7 +1472,7 @@ async def plan_list(interaction: discord.Interaction):
 @app_commands.autocomplete(key=plan_autocomplete)
 async def plan_remove(interaction: discord.Interaction, key: str):
     if not is_staff(interaction):
-        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        await interaction.response.send_message(embed=deny_embed(), ephemeral=True)
         return
     ok = remove_plan(slugify_plan(key))
     await interaction.response.send_message(
@@ -1519,7 +1524,7 @@ key_group = app_commands.Group(name="key", description="Manage license keys (sta
 @key_group.command(name="lookup", description="Look up a license key.")
 async def key_lookup(interaction: discord.Interaction, key: str):
     if not is_staff(interaction):
-        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        await interaction.response.send_message(embed=deny_embed(), ephemeral=True)
         return
     row = get_key(key.strip())
     if not row:
@@ -1539,7 +1544,7 @@ async def key_lookup(interaction: discord.Interaction, key: str):
 @key_group.command(name="revoke", description="Revoke a key so it stops validating.")
 async def key_revoke(interaction: discord.Interaction, key: str):
     if not is_staff(interaction):
-        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        await interaction.response.send_message(embed=deny_embed(), ephemeral=True)
         return
     ok = set_key_revoked(key.strip(), True)
     if ok:
@@ -1551,7 +1556,7 @@ async def key_revoke(interaction: discord.Interaction, key: str):
 @key_group.command(name="unrevoke", description="Re-enable a revoked key.")
 async def key_unrevoke(interaction: discord.Interaction, key: str):
     if not is_staff(interaction):
-        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        await interaction.response.send_message(embed=deny_embed(), ephemeral=True)
         return
     ok = set_key_revoked(key.strip(), False)
     if ok:
@@ -1563,7 +1568,7 @@ async def key_unrevoke(interaction: discord.Interaction, key: str):
 @key_group.command(name="resethwid", description="Clear a key's machine lock so it can be used on a new PC.")
 async def key_resethwid(interaction: discord.Interaction, key: str):
     if not is_staff(interaction):
-        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        await interaction.response.send_message(embed=deny_embed(), ephemeral=True)
         return
     ok = reset_key_hwid(key.strip())
     if ok:
@@ -1575,7 +1580,7 @@ async def key_resethwid(interaction: discord.Interaction, key: str):
 @key_group.command(name="resend", description="Re-send a key and its file to the buyer's DMs.")
 async def key_resend(interaction: discord.Interaction, key: str):
     if not is_staff(interaction):
-        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        await interaction.response.send_message(embed=deny_embed(), ephemeral=True)
         return
     row = get_key(key.strip())
     if not row:
@@ -1603,7 +1608,7 @@ async def key_resend(interaction: discord.Interaction, key: str):
 async def key_generate(interaction: discord.Interaction, member: discord.Member,
                        product: str, duration: app_commands.Choice[str] = None, dm: bool = True):
     if not is_staff(interaction):
-        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        await interaction.response.send_message(embed=deny_embed(), ephemeral=True)
         return
     if get_product(product) is None:
         await interaction.response.send_message(
@@ -1634,7 +1639,7 @@ bot.tree.add_command(key_group)
 @app_commands.describe(member="Whose keys to list")
 async def keys_cmd(interaction: discord.Interaction, member: discord.Member):
     if not is_staff(interaction):
-        await interaction.response.send_message("You can't use this.", ephemeral=True)
+        await interaction.response.send_message(embed=deny_embed(), ephemeral=True)
         return
     rows = keys_for_user(member.id)
     if not rows:
@@ -1821,7 +1826,10 @@ class VerifyView(discord.ui.View):
         try:
             await interaction.user.add_roles(role, reason="Verified via button")
             await interaction.response.send_message(
-                f"You're verified — welcome in! {role.mention}", ephemeral=True)
+                embed=brand_embed("✅  Verified!",
+                                  f"You're in — welcome aboard! 🦈\nYou've been given {role.mention}.",
+                                  color=0x57F287, author_sub="GATE"),
+                ephemeral=True)
         except discord.Forbidden:
             await interaction.response.send_message(
                 "I couldn't add the role. My role needs to be **above** the verified role and have "
@@ -2306,6 +2314,45 @@ async def start_http():
 
 
 _ready_once = False
+_presence_i = 0
+
+
+@tasks.loop(seconds=20)
+async def rotate_presence():
+    """Cycle a set of branded status lines, some backed by live numbers."""
+    global _presence_i
+    try:
+        keys = linked = 0
+        try:
+            con = sqlite3.connect(DB_PATH)
+            keys = con.execute("SELECT COUNT(*) FROM licenses").fetchone()[0]
+            linked = con.execute("SELECT COUNT(*) FROM links").fetchone()[0]
+            con.close()
+        except Exception:
+            pass
+        members = sum(g.member_count or 0 for g in bot.guilds)
+
+        rotation = [
+            (discord.ActivityType.watching,  f"🦈 {BRAND_NAME}"),
+            (discord.ActivityType.playing,   f"⚡ /help for commands"),
+            (discord.ActivityType.watching,  f"🔑 {keys} keys issued"),
+            (discord.ActivityType.watching,  f"👥 {members} members"),
+            (discord.ActivityType.listening, f"🎫 your support tickets"),
+            (discord.ActivityType.playing,   f"🛒 buy @ the website"),
+        ]
+        atype, name = rotation[_presence_i % len(rotation)]
+        _presence_i += 1
+        await bot.change_presence(
+            status=discord.Status.online,
+            activity=discord.Activity(type=atype, name=name),
+        )
+    except Exception as e:
+        log.error("presence rotate failed: %s", e)
+
+
+@rotate_presence.before_loop
+async def _before_presence():
+    await bot.wait_until_ready()
 
 
 @bot.event
@@ -2331,6 +2378,11 @@ async def on_ready():
             await bot.tree.sync()
     except Exception as e:
         log.error("Command sync failed: %s", e)
+
+    # Branded rotating presence — cycles live stats every 20s
+    if not rotate_presence.is_running():
+        rotate_presence.start()
+
     await start_http()
     log.info("Logged in as %s", bot.user)
 
